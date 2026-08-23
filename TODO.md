@@ -89,11 +89,14 @@ r_{\Delta Q_{\mathrm{trans}}}^{e}
    - Depends on #17
    - No GitHub issue yet
 
-19. **Exogenous \(r_{\Delta Q_{\mathrm{trans}}}^{e}\)** — `feat`
+19. **Exogenous \(r_{\Delta Q_{\mathrm{trans}}}^{e}\)** — `feat` — **split spine Lane B** (Option 3, 2026-08-23)
    - **MUST** keep this symbol / spelling in code, tests, issues, and docs
+   - Type: `TransactionalReturn` (not `TransactionalExpectedReturn` — avoids conflating return with MEV \(r^{\phi}\) or fee price)
+   - Evaluator: `runTransSwapAlongTenorMixture`; leg blend \(w\) documented as implementation device only
    - Orthogonal to directional price moves; volatility-measured (arbs not directional)
    - Cite MEV note for motivation only — **never** adopt its \(\Delta\pi_{\mathrm{trans}}\) naming
-   - Decide: first-class return type vs notes-only scalar control
+   - Lane A (\(\delta_{\mathrm{trans}}\), \(r^{\phi}=\phi\cdot\delta_{\mathrm{trans}}\)) is Slice 2 / #7; bridge \(r_{\mathrm{trans}}^{e}\leftrightarrow\delta^{\star}\) via #23 golden paths
+   - Spec: `docs/superpowers/specs/2026-08-22-scratchpad-rarb-trans-flow-design.md` §1b, §2
    - No GitHub issue yet
 
 20. **\(\sigma_{IV}\) stand-in** — `feat`
@@ -120,7 +123,7 @@ r_{\Delta Q_{\mathrm{trans}}}^{e}
    - Shock: \(V=\bar L e^u\), \(\delta^\*\) → `volTgtWad`, `txlVolumeRate`; \(u=\ln(V/\bar L)=\ln\kappa\) at prover boundary
    - Derive \(\nu_{\mathrm{trans}}=\sum\sqrt{\bar p|\Delta Q_X\Delta Q_M|}\) from JSON `dQx`/`dQM`; \(g=\nu_{\mathrm{trans}}/V\)
    - Golden table \(g(\delta^\*,\kappa,\bar\phi,\ldots)\) from GAMS grid (`make test-gams`); option A (exogenous \(\nu\)) **pre-prover stub only**
-   - Prereq for #7 \(\delta_{\mathrm{trans}}=\nu_{\mathrm{trans}}/\pi_{\mathrm{trans}}^{\Delta Q}\) beyond stub; complements RARB Slice 1 (#19 trans tag)
+   - Prereq for #7 \(\delta_{\mathrm{trans}}=\nu_{\mathrm{trans}}/\pi_{\mathrm{trans}}^{\Delta Q}\) beyond stub; complements RARB Slice 1 Lane B (#19 `TransactionalReturn`)
    - Reads: `refs/volume_path.gms`, `refs/VOLUME_PATH.md`, `refs/MEV_TAX_MODEL_ONE_NOTES.md`
 
 24. **\(\pi^{\varphi}=\pi^{\phi}-\pi^{\mathrm{LVR}}\) decomposition** — `docs`→`feat` — [#35](https://github.com/JMSBPP/cfmm-volInstrumentsFormal/issues/35)
