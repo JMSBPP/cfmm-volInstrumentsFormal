@@ -129,13 +129,14 @@ r_{\Delta Q_{\mathrm{trans}}}^{e}
    - \(\pi^{\mathrm{arb}}\equiv\pi_{\mathrm{arb}}^{\Delta Q}\) (#21); LVR = normalized return read off arb leg; \(r^{\varphi}=r^{\phi}-r^{\mathrm{LVR}}\)
    - Depends: RARB trans tag (#19), arb mixture (#21); CLMM identity test vs `CLMMPosition`
 
-25. **\(\pi^{\sigma}=f(\pi^{\varphi})\) — Panoptic/Haskell bridge (not MEV Σ)** — `docs`→`feat` — [#36](https://github.com/JMSBPP/cfmm-volInstrumentsFormal/issues/36)
+25. **\(\pi^{\sigma}=f(\pi^{\varphi})\) — Panoptic/Haskell bridge (not MEV Σ)** — ~~`docs`~~→`feat` — [#36](https://github.com/JMSBPP/cfmm-volInstrumentsFormal/issues/36) / docs half merged [#38](https://github.com/JMSBPP/cfmm-volInstrumentsFormal/pull/38) (2026-08-23)
    - **Ground truth:** shipped Hop A/B — \(\pi^{\sigma}=\Delta Q_{v}\cdot\Pi^{\sigma}_{\mathrm{opt}}\) with
      \(\Pi^{\sigma}_{\mathrm{opt}}=N_{\mathrm{id}}\bigl((P-P^{\star})/P^{\star}-\ln(P/P^{\star})\bigr)+R\) (`VariancePortfolio` / `MintPlan` → `targetVegaFromMint`)
-   - **Open:** identify how \(\pi^{\varphi}\) (CLMM / fee−LVR, #24) enters \(\Pi_{\mathrm{opt}}\) / \(R\) / the book — board claim \(\pi^{\sigma}=f(\pi^{\varphi})\); MEV \(\sum L(i)\pi^{\varphi}(i)\) is **not** ground truth
+   - ~~**Open:** identify how \(\pi^{\varphi}\) enters \(\Pi_{\mathrm{opt}}\) / \(R\) / the book~~ **Pinned (README, #38):** \(\hat\pi^{\sigma}\equiv\sum_{k=0}^{3}[\pi^{\varphi}(\ell_k;p^\star)-\pi^{\varphi}(\ell_k;p)]\), \(\ell_k=(i_k^-,i_k^+,L_k)\), \(L_k=\Lambda(i_k^-,i_k^+;\mathrm{or}(k)\Delta Q_\upsilon)\); \(\pi^{\varphi}(\ell;p_{1/2})\) = Uniswap V3 position value. Hop A/B \(F-\mathrm{Log}\) = continuum-limit remark; MEV \(\sum L(i)\pi^{\varphi}(i)\) = short side, **not** ground truth
+   - **`feat` open:** (a) `volOrderToMintPlan` → four \(\ell_k\) chunks (now one envelope chunk); (b) \(\Lambda\) amount→liquidity and \(\mathrm{or}(k)\to L_k\) (`OptionRatio.hs` TODO); (c) test Hop B `fromLegs` vs 4-leg chunk sum; (d) CLMM normalization \(c(\kappa,r)\) vs `CLMMPosition` — blocked on #24
    - Spec pointer: `cfmm-theory/docs/superpowers/specs/2026-08-19-scratchpad-target-vega-replication-design.md` (≡^R OPEN); roadmap roles doc
    - Depends: #24 (net \(\pi^{\varphi}\)); uses existing `VariancePortfolio` / `CLMMPosition`
-   - Deliverable: design note pinning \(f\) from Haskell; then code/tests if warranted
+   - Deliverable: ~~design note pinning \(f\) from Haskell~~ (#38); then code/tests (a)–(d)
 
 Later (not opened yet): compose \(r_{\Delta Q}^{e}\) from #19+#21; wire into parametrized \(\pi^{\Delta Q}/\pi^{\phi}\); then unblock #6.
 
