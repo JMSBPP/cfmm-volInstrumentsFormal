@@ -3,6 +3,10 @@
 module Greeks.Delta
   ( Delta(..)
   , DeltaX96(..)
+  , PriceDeltaX96(..)
+  , PayoffDelta(..)
+  , deltaOfPayoff
+  , payoffDeltaLayout
   , pattern DELTA_ATM
   , coveredCallDelta
   , rangeAccrualDelta
@@ -18,8 +22,11 @@ import Graphics.Rendering.Chart.Easy
 import qualified Payoffs.Payoff as Payoff
 
 import OptionRatio (OptionRatio(..))
+import Plotting.PlotSqrt (PlotY(..), sqrtFunctionLayout)
 import SqrtGrid
-  ( SqrtPriceX96(..)
+  ( integerSqrt
+  , mulDiv
+  , SqrtPriceX96(..)
   , PayoffX96(..)
   , SqrtPlot(..)
   , pattern Q96
@@ -34,18 +41,43 @@ newtype Delta = Delta { runDelta :: SqrtPriceX96 -> Rational }
 newtype DeltaX96 = DeltaX96 Integer
   deriving (Show, Eq, Ord)
 
+-- | ∂_P V of a token1-valued payoff V with respect to PRICE P = p²/Q96:
+-- ΔV · Q96 / ΔP, i.e. a raw token0 amount (signed).  This is the delta that
+-- the hedge ledger of the rebate note (Defs 12–14) tracks in token units.
+newtype PriceDeltaX96 = PriceDeltaX96 Integer
+  deriving (Show, Eq, Ord)
+
+-- | A delta is a function of a payoff: `PayoffDelta` is the ∂_P of SOME
+-- `Payoff SqrtPriceX96`.  `deltaOfPayoff` is the generic (finite-difference)
+-- instance; `Payoffs.ReplicaDelta.replicaDelta` is the closed-form instance
+-- for `fourLegReplica`, tested against the generic one.
+newtype PayoffDelta = PayoffDelta { runPayoffDelta :: SqrtPriceX96 -> PriceDeltaX96 }
+
+-- | Central difference in price, bump = p/2^16 in sqrt-price (≈ 0.3 bp in P,
+-- ≈ 0.3 tick — narrower than any leg), floored at 1 wei.  Integer throughout; exact for payoffs that
+-- are linear in P on the bump window, O(bump) at kinks.
+deltaOfPayoff :: Payoff.Payoff SqrtPriceX96 -> PayoffDelta
+deltaOfPayoff (Payoff.Payoff f) =
+  PayoffDelta $ \(SqrtPriceX96 p) ->
+    let h = max 1 (p `div` 65536)
+        PayoffX96 vUp = f (SqrtPriceX96 (p + h))
+        PayoffX96 vDn = f (SqrtPriceX96 (p - h))
+        PayoffX96 pUp = Payoff.squareSqrtPrice (SqrtPriceX96 (p + h))
+        PayoffX96 pDn = Payoff.squareSqrtPrice (SqrtPriceX96 (p - h))
+    in  PriceDeltaX96 (mulDiv (vUp - vDn) Q96 (pUp - pDn))
+
+-- | Deltas on one sqrt axis; y = raw token0 (EVM word), plotted through the
+-- PayoffX96 channel of `sqrtFunctionLayout`.
+payoffDeltaLayout :: SqrtPlot -> [(String, PayoffDelta)] -> Layout Double Double
+payoffDeltaLayout config labeled =
+  sqrtFunctionLayout config (RawY "token0 (raw, signed)")
+    [ (lbl, \p -> let PriceDeltaX96 d = runPayoffDelta pd p in PayoffX96 d)
+    | (lbl, pd) <- labeled ]
+
 -- δ = 1/2
 pattern DELTA_ATM :: DeltaX96
 pattern DELTA_ATM = DeltaX96 39614081257132168796771975168
 
-integerSqrt :: Integer -> Integer
-integerSqrt n
-  | n <= 0 = 0
-  | otherwise = go (1 + n `div` 2)
-  where
-    go x =
-      let x' = (x + n `div` x) `div` 2
-      in  if x' >= x then x else go x'
 
 -- (3.23) in price coordinates, then κ_{1/2} = √K · 2^96
 strikeFromDelta

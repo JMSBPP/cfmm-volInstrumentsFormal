@@ -1,4 +1,4 @@
-module Payoffs.NId
+module Panoptic.NId
   ( NId
   , mkNId
   , unNId
@@ -11,6 +11,7 @@ module Payoffs.NId
   , panopticTickSpacing
   , panopticOptionRatio
   , panopticIsLong
+  , panopticAsset
   , panopticTokenType
   , panopticStrike
   , panopticWidth
@@ -20,8 +21,8 @@ module Payoffs.NId
 
 import Data.Bits (shiftL, shiftR, (.&.))
 import Liquidity.LiquidityChunk (createChunk)
-import Payoffs.MintPlan (MintPlan(..), PanopticTokenId(..), fourLegNumLegs)
-import Payoffs.TargetVega (mkTargetVega, unTargetVega)
+import Panoptic.MintPlan (MintPlan(..), PanopticTokenId(..), fourLegNumLegs)
+import TargetVega (mkTargetVega, unTargetVega)
 import Pricing.PriceDeformation (uniswapMaxTick, uniswapMinTick)
 import SqrtGrid (unTickSpacing)
 import Volatility.VolOrder
@@ -40,7 +41,7 @@ newtype NId = NId Int
 mkNId :: Int -> NId
 mkNId n
   | n < 2 || odd n =
-      error "Payoffs.NId.mkNId: N must be even and ≥ 2"
+      error "Panoptic.NId.mkNId: N must be even and ≥ 2"
   | otherwise = NId n
 
 unNId :: NId -> Int
@@ -54,8 +55,8 @@ scaleByNId (NId n) x = (2 * x) `div` toInteger n
 
 -- Hop B: EVM/Panoptic tokenId + SFPM positionSize. ΔQ_v* is not in the id.
 -- Layout matches plank PanopticTokenId.plk (TokenId.sol offsets).
--- PanopticTokenId / MintPlan / fourLegNumLegs live in Payoffs.MintPlan
--- (split out so Payoffs.TargetVega, needed by Volatility.VolOrder's
+-- PanopticTokenId / MintPlan / fourLegNumLegs live in Panoptic.MintPlan
+-- (split out so TargetVega, needed by Volatility.VolOrder's
 -- targetVega field, does not import this module — avoids a
 -- NId → VolOrder → TargetVega → NId cycle).
 
@@ -70,15 +71,15 @@ volOrderToTokenId
   -> PanopticTokenId
 volOrderToTokenId vo poolId (r0, r1, r2, r3)
   | any (\r -> r < 1 || r > 127) [r0, r1, r2, r3] =
-      error "Payoffs.NId.volOrderToTokenId: optionRatio must be in 1..127"
+      error "Panoptic.NId.volOrderToTokenId: optionRatio must be in 1..127"
   | not (all spanFeasible intervals) =
-      error "Payoffs.NId.volOrderToTokenId: each leg span must be >= tick spacing"
+      error "Panoptic.NId.volOrderToTokenId: each leg span must be >= tick spacing"
   | putSide < 2 * d || callSide < 2 * d =
-      error "Payoffs.NId.volOrderToTokenId: each side of i* must be >= 2 * tick spacing"
+      error "Panoptic.NId.volOrderToTokenId: each side of i* must be >= 2 * tick spacing"
   | not (all widthPackable intervals) =
-      error "Payoffs.NId.volOrderToTokenId: each leg width must be < 4096 tick spacings (TokenId width field is 12 bits)"
+      error "Panoptic.NId.volOrderToTokenId: each leg width must be < 4096 tick spacings (TokenId width field is 12 bits)"
   | not (all tickInPoolBounds allTicks) =
-      error "Payoffs.NId.volOrderToTokenId: ticks must satisfy |tick| <= uniswapMaxTick"
+      error "Panoptic.NId.volOrderToTokenId: ticks must satisfy |tick| <= uniswapMaxTick"
   | otherwise =
       let
         tid0 = addLegFromBucket 0 l0 h0 d 0
@@ -89,7 +90,10 @@ volOrderToTokenId vo poolId (r0, r1, r2, r3)
         tid5 = addTokenType tid4 0 1
         tid6 = addTokenType tid5 1 2
         tid7 = addTokenType tid6 1 3
-        tid8 = addIsLong tid7 1 0
+        -- asset = 1 on every leg: single token1 basis for positionSize·optionRatio
+        -- (PanopticMath.getLiquidityChunk: asset==1 → getLiquidityForAmount1). TODO #28 item 0.
+        tidA = addAsset (addAsset (addAsset (addAsset tid7 1 0) 1 1) 1 2) 1 3
+        tid8 = addIsLong tidA 1 0
         tid9 = addIsLong tid8 1 1
         tid10 = addIsLong tid9 1 2
         tid11 = addIsLong tid10 1 3
@@ -156,6 +160,11 @@ panopticOptionRatio :: PanopticTokenId -> Integer -> Integer
 panopticOptionRatio tid leg =
   shiftR (tokenId tid) (legBase leg + 1) .&. 0x7f
 
+-- | asset bit: TokenId bit 64 + 48·leg (TokenId.sol `asset`).
+panopticAsset :: PanopticTokenId -> Integer -> Integer
+panopticAsset tid leg =
+  shiftR (tokenId tid) (legBase leg) .&. 0x1
+
 panopticIsLong :: PanopticTokenId -> Integer -> Integer
 panopticIsLong tid leg =
   shiftR (tokenId tid) (legBase leg + 8) .&. 0x1
@@ -189,6 +198,10 @@ addOptionRatio :: Integer -> Integer -> Integer -> Integer
 addOptionRatio tid v leg =
   addField tid (legBase leg + 1) 0x7f v
 
+addAsset :: Integer -> Integer -> Integer -> Integer
+addAsset tid v leg =
+  addField tid (legBase leg) 0x1 v
+
 addIsLong :: Integer -> Integer -> Integer -> Integer
 addIsLong tid v leg =
   addField tid (legBase leg + 8) 0x1 v
@@ -212,9 +225,9 @@ addWidth tid width leg =
 addLegFromBucket :: Integer -> Integer -> Integer -> Integer -> Integer -> Integer
 addLegFromBucket tid lo hi ts leg =
   let
-    span = hi - lo
-    strike = lo + span `div` 2
-    width = span `div` ts
+    tickSpan = hi - lo
+    strike = lo + tickSpan `div` 2
+    width = tickSpan `div` ts
   in
     addWidth (addStrike tid strike leg) width leg
 

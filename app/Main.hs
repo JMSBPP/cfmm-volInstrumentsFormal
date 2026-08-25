@@ -1,13 +1,15 @@
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE DisambiguateRecordFields #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE MonoLocalBinds #-}
 
 module Main (main) where
 
 import System.Directory (createDirectoryIfMissing)
 
 import OptionRatio (OptionRatio(..))
-import PlotUtils (Panel(..), writePanel)
+import Plotting.PlotUtils (Panel(..), writePanel)
 import Pricing.PriceDeformation
   ( EtaX96(..)
   , deformationLayout
@@ -24,8 +26,8 @@ import Pricing.Stremia
   , plotFeeVsReturn
   )
 import Payoffs.Linear (linearPayoff)
-import Payoffs.PlotSqrt (PlotY(..), plotSqrtFunction)
-import Payoffs.PlotInterest
+import Plotting.PlotSqrt (PlotY(..), plotSqrtFunction, sqrtFunctionLayout)
+import Plotting.PlotInterest
   ( InterestPlot(..)
   , plotInterestFunction
   , plotInterestTickFunction
@@ -48,11 +50,29 @@ import Pricing.InterestSqrt (interestSqrtX96, mkInterestTick)
 import qualified Payoffs.Payoff as Payoff
 import Greeks.Delta (deltaLayout)
 import Greeks.Gamma (gammaLayout, kristensenGammaLayoutVsGamma)
-import Payoffs.CPMMPosition (rhsPayoffLayout)
+import Payoffs.CLMMPosition (chunkFromStrike, rhsPayoffLayout, scaledVsUnitLayout)
 import Payoffs.Forward (AtmForward(..))
-import Payoffs.NId (MintPlan(..), fourLegSkeleton, mkNId)
-import Payoffs.TargetVega (mkTargetVega, positionSizeForTargetVega)
-import Liquidity.LiquidityChunk (createChunk)
+import Payoffs.Log (nakedLogQ96, nakedLogTickQ96)
+import Panoptic.NId (MintPlan(..), fourLegSkeleton, mkNId, volOrderToMintPlan)
+import Payoffs.ReplicaDelta (replicaDeltaLayout)
+import Payoffs.HolderPath (Regime(..), arbShare, composedPath)
+import Payoffs.LvrRate (lvrRateLayout, lvrRateOn, naiveBandTicks, rationalBandTicks)
+import Payoffs.VolatilityReplica (ErrorX96(..), legsLayout, replicaError, replicaLayout, windowTicks)
+import Panoptic.Binning (binToLegs, ladderFromVolOrder, mintPlanFromLadder, quantizationReport)
+import Payoffs.LadderPosition (ladderN1, ladderT1)
+import Volatility.VolOrder (VolOrder, mkVolOrder, mkVolRangeWidth, mkVolSkew)
+import Payoffs.VolatilityReplica (fourLegReplica)
+import Panoptic.NId (volOrderToTokenId)
+import qualified Payoffs.PathAccrual as PA
+import Payoffs.LadderPosition (cOfS, ladderDensityLayout, ladderFromSpan, ladderLayout, ladderReturnQ96, logPortfolioQ96)
+import Volatility.VolOrder (fixtureSymmetricVolOrder)
+import TargetVega (mkTargetVega, positionSizeForTargetVega)
+import Liquidity.LiquidityChunk
+  ( chunkLiquidity
+  , chunkTickLower
+  , chunkTickUpper
+  , createChunk
+  )
 import Payoffs.VariancePortfolio
   ( variancePortfolioLayout
   , variancePortfolioLayoutVsGamma
@@ -79,6 +99,7 @@ import SqrtGrid
   , mkTickSpacing
   , pattern Q96
   , sqrtPriceX96
+  , mulDiv
   )
 import State
   ( pattern SQRT_PRICE_1_4
@@ -92,6 +113,11 @@ import Volatility.CevField
   )
 import Volatility.VolTermStructure (BarL(..), FlowVol(..), cevFromPhi)
 import StrikeX96 (strike)
+
+-- Avoid DuplicateRecordFields update/selector ambiguity with InterestPlot.
+retitleSqrt :: SqrtPlot -> String -> String -> SqrtPlot
+retitleSqrt (SqrtPlot _ xa _ xmin xmax) title ya =
+  SqrtPlot title xa ya xmin xmax
 
 main :: IO ()
 main = do
@@ -135,10 +161,9 @@ main = do
 
   plotSqrtFunction
     "outputs/Payoffs/Returns/stremia-bid-ask.png"
-    config
-      { plotTitle = "mid / ask/bid ReturnPips (FeePips 100 & 3000)"
-      , yAxisTitle = "ReturnPips"
-      }
+    (retitleSqrt config
+      "mid / ask/bid ReturnPips (FeePips 100 & 3000)"
+      "ReturnPips")
     ReturnY
     [ linearPayoff
     , nakedAskQ96 (mkFeePips 100)
@@ -179,10 +204,9 @@ main = do
     tHi = mkInterestTick 100
   plotSqrtFunction
     "outputs/Payoffs/swap-pay-linear-vs-sqrtPriceX96.png"
-    config
-      { plotTitle = "Swap pay: linear×(1-φ_X) (φ_X=100)"
-      , yAxisTitle = "PayoffX96"
-      }
+    (retitleSqrt config
+      "Swap pay: linear×(1-φ_X) (φ_X=100)"
+      "PayoffX96")
     PayoffY
     [Payoff.runPayoff payPf]
   plotInterestFunction
@@ -215,10 +239,9 @@ main = do
     TransactionalFeeCapture (Leg capPayPf) (Leg capRecvPf) = fcDemo
   plotSqrtFunction
     "outputs/Payoffs/fee-capture-pay-vs-sqrtPriceX96.png"
-    config
-      { plotTitle = "Fee capture pay: linear×φ_X (φ_X=100)"
-      , yAxisTitle = "PayoffX96"
-      }
+    (retitleSqrt config
+      "Fee capture pay: linear×φ_X (φ_X=100)"
+      "PayoffX96")
     PayoffY
     [Payoff.runPayoff capPayPf]
   plotInterestFunction
@@ -266,6 +289,17 @@ main = do
       (Cell (rhsPayoffLayout config strikePrice ratio etaTwoThirds))
       (Cell (gammaLayout config strikePrice ratio))
     )
+
+  -- TODO #27: CLMMPosition is chunk-constructed. Unit chunk of (k, r)
+  -- (amount0 = 1 token0) vs the same ticks at 2× liquidity (amount0 = 2).
+  let
+    unitCh   = chunkFromStrike strikePrice ratio
+    doubleCh = createChunk (chunkTickLower unitCh) (chunkTickUpper unitCh) (2 * chunkLiquidity unitCh)
+  writePanel
+    "outputs/Payoffs/clmm-chunk-vs-unit.png"
+    (Cell (scaledVsUnitLayout
+             (retitleSqrt config "CLMMPosition: unit chunk vs 2× liquidity chunk (amount0 scale)" "PayoffX96")
+             doubleCh))
 
   let
     spacing10 = mkTickSpacing 10
@@ -384,6 +418,178 @@ main = do
     hopBAtm = AtmForward (sqrtPriceX96 0)
     hopBNid = mkNId 32
     hopBMin = -160
+
+  -- TODO #25 (#36): the 4-leg replica π̂^σ from leg chunks (fixture VolOrder,
+  -- legs ±20 ticks about i* = 0, ΔQ_υ = 1e18, or = (1,2,3,4)).
+  let
+    replicaPlan = volOrderToMintPlan (fixtureSymmetricVolOrder (mkTargetVega (10 ^ (18 :: Int)))) 0 (1, 2, 3, 4)
+    replicaCfg  = SqrtPlot
+      { plotTitle  = "π̂^σ = Σ_leg [H_leg − π^φ(LC_leg)] (4-leg Panoptic, ΔQ_υ = 1e18)"
+      , xAxisTitle = "sqrtPriceX96"
+      , yAxisTitle = "PayoffX96 (token1)"
+      , xMin       = sqrtPriceX96 (-60)
+      , xMax       = sqrtPriceX96 60
+      }
+    legsCfg = retitleSqrt replicaCfg "Per-leg terms H_leg − π^φ(LC_leg) and their sum" "PayoffX96 (token1)"
+    pStar0  = sqrtPriceX96 0
+  writePanel
+    "outputs/Payoffs/Replica/panel-legs-replica.png"
+    (Beside
+      (Cell (legsLayout legsCfg replicaPlan))
+      (Cell (replicaLayout replicaCfg replicaPlan pStar0 []))
+    )
+
+  -- TODO #33 (#86): Δ̂^σ = ∂_P π̂^σ — closed form vs central difference (rebate note Def 12).
+  let deltaCfg = retitleSqrt replicaCfg "Δ̂^σ = ∂_P π̂^σ (raw token0): closed form vs central difference" "token0 (raw)"
+  writePanel
+    "outputs/Payoffs/Replica/panel-replica-delta.png"
+    (Cell (replicaDeltaLayout deltaCfg replicaPlan pStar0))
+
+  -- TODO #35: [ν_arb/ν] as an OUTPUT of the update rule — pips vs fee band (ticks),
+  -- holder active (gas = 1 tick) vs inactive.  Axes: ticks, pips (uint24).
+  let shareLine active =
+        [ (toInteger band, PA.unArbSharePips (arbShare (composedPath 5 0 400 3 4 (Regime 1 band active))))
+        | band <- [0, 2 .. 40] ]
+  writePanel
+    "outputs/Payoffs/Accrual/panel-arbshare-vs-band.png"
+    (Cell (PA.linesLayout "[ν_arb/ν] read off the composed path (trans ±3, ext ±4 ticks/round)" "fee band (ticks)" "arb share (pips)"
+             [ ("holder inactive", shareLine False), ("holder active, gas = 1 tick", shareLine True) ]))
+
+  -- TODO #26 (#51): λ_{X/M} ex post — LVR_net per arb tick vs external step, three fee levels.
+  -- Naive band φ crosses zero at s = 2φ ticks; rational band 2φ is ≥ 0 (Prop 4 and its corollary).
+  let chWideP = createChunk (-4000) 4000 (10 ^ (20 :: Int))
+      phiW    = mkFeePips 1000
+      wideLine band = [ (toInteger sv, lvrRateOn 5 0 600 2 phiW band [chWideP] sv) | sv <- [2, 4 .. 60] ]
+  writePanel
+    "outputs/Payoffs/Accrual/panel-lvr-rate-vs-step.png"
+    (Beside
+      (Cell (lvrRateLayout 5 0 600 2 replicaPlan (map mkFeePips [1000, 2000]) [2, 4 .. 60]))
+      (Cell (PA.linesLayout "continuous liquidity (one chunk over the path), φ = 1000 pips" "external step s (ticks / round)" "LVR_net / Σ amount_in (pips)"
+               [ ("band φ (naive): crosses at 2φ = 20 ticks", wideLine (naiveBandTicks phiW))
+               , ("band 2φ (rational): ≥ 0", wideLine (rationalBandTicks phiW)) ])))
+
+  -- TODO #28.2: T1 geometric ladder (S = 4000, Δ = 10, ι = 400, ξ*) — README § REPLICATION_THEORY
+  -- Theorem 10 overlay (same units: T1/N_1 vs c(S)·logPortfolio), residual, rung density.
+  let
+    ladT1  = ladderFromSpan (-2000) 2000 spacing10 0 (mkTargetVega (10 ^ (24 :: Int)))
+    cS     = cOfS 4000
+    t1Cfg  = SqrtPlot
+      { plotTitle  = "Thm 10: T1/N_1 (geometric ladder at ξ*, S=4000, Δ=10) vs c(S)·logPortfolio, c = " ++ take 7 (show cS)
+      , xAxisTitle = "sqrtPriceX96"
+      , yAxisTitle = "return (Q96)"
+      , xMin       = sqrtPriceX96 (-2000)
+      , xMax       = sqrtPriceX96 2000
+      }
+    resCfg = retitleSqrt t1Cfg "residual T1/N_1 − c(S)·logPortfolio (Q96)" "Q96"
+    resid p = let PayoffX96 a = ladderReturnQ96 ladT1 p
+                  PayoffX96 b = logPortfolioQ96 p (sqrtPriceX96 0)
+              in  PayoffX96 (a - floor (cS * fromIntegral b))
+    denCfg = retitleSqrt t1Cfg "rung liquidity L(i_x) = ΔQ·ℓ(ξ*, ι; x) (Thm 7)" "liquidity"
+  writePanel
+    "outputs/Payoffs/Replica/panel-t1-vs-t0.png"
+    (Beside
+      (Cell (ladderLayout t1Cfg ladT1))
+      (Cell (sqrtFunctionLayout resCfg PayoffY [("residual", resid)]))
+    )
+  writePanel
+    "outputs/Payoffs/Replica/t1-ladder-density.png"
+    (Cell (ladderDensityLayout denCfg ladT1))
+
+  -- TODO #28.3: 𝓑 binning of the ξ* ladder into 4 legs; T2 vs T1 (both / N_1); width sweep.
+  let
+    voOf :: Int -> VolOrder
+    voOf s = mkVolOrder (mkVolRangeWidth (toInteger s) spacing10) (mkVolStrike Q96) (mkVolSkew 32768) (mkTargetVega (10 ^ (24 :: Int)))
+    vo4k   = voOf 4000
+    lad4k  = ladderFromVolOrder vo4k
+    plan4k = mintPlanFromLadder 0 lad4k vo4k
+    PayoffX96 n1B = ladderN1 lad4k
+    normBy y = PayoffX96 (mulDiv y Q96 n1B)
+    t1n p = let PayoffX96 y = Payoff.runPayoff (ladderT1 lad4k) p in normBy y
+    t2n p = let PayoffX96 y = Payoff.runPayoff (fourLegReplica plan4k (sqrtPriceX96 0)) p in normBy y
+    fixn p = let PayoffX96 y = Payoff.runPayoff (fourLegReplica (MintPlan (volOrderToTokenId vo4k 0 (1,2,3,4)) (mintChunk plan4k)) (sqrtPriceX96 0)) p in normBy y
+    (orsB, _) = binToLegs 8 lad4k vo4k
+    t2Cfg = SqrtPlot
+      { plotTitle  = "T2 = 𝓑(T1) 4-leg (or = " ++ show orsB ++ ") vs T1 ladder, both / N_1 (S=4000, Δ=10)"
+      , xAxisTitle = "sqrtPriceX96"
+      , yAxisTitle = "return (Q96)"
+      , xMin       = sqrtPriceX96 (-3000)
+      , xMax       = sqrtPriceX96 3000
+      }
+    fixCfg = retitleSqrt t2Cfg "fixture or = (1,2,3,4) vs T1 (for contrast)" "return (Q96)"
+  writePanel
+    "outputs/Payoffs/Replica/panel-t2-vs-t1.png"
+    (Beside
+      (Cell (sqrtFunctionLayout t2Cfg PayoffY [("T1 ladder", t1n), ("T2 = 𝓑(T1)", t2n)]))
+      (Cell (sqrtFunctionLayout fixCfg PayoffY [("T1 ladder", t1n), ("T2 fixture (1,2,3,4)", fixn)]))
+    )
+  -- width sweep: e^σ_W(𝓑) vs span S (stride 50 on 3× span)
+  let
+    sweep = [ (s, e)
+            | s <- [400, 1000, 2000, 4000, 8000]
+            , let vo = voOf s
+            , let lad = ladderFromVolOrder vo
+            , let ErrorX96 e = replicaError lad (mintPlanFromLadder 0 lad vo) (windowTicks vo 50) ]
+  putStrLn "width sweep S → e^σ_W(𝓑):"
+  mapM_ (\(s, e) -> putStrLn ("  S=" ++ show s ++ "  e=" ++ show (fromIntegral e / fromIntegral Q96 :: Double))) sweep
+  putStrLn "quantization report S=4000 (leg, or, relErr ppm, bound ppm):"
+  mapM_ print (quantizationReport lad4k vo4k)
+
+  -- TODO #30: path accrual comparative statics on the 𝓑 plan (S=4000):
+  -- (a) vs atomic arb share at fixed step size; (b) vs step size (vol proxy) at share 50%.
+  let
+    phiXa = mkFeePips 500
+    phiMa = mkFeePips 3000
+    totalA accs = foldr PA.addAccrual PA.zeroAccrual accs
+    rowFor :: Int -> Integer -> (Integer, Integer, Integer, Integer, Integer)
+    rowFor step sharePips =
+      let path = PA.syntheticPath 11 0 step 400 (PA.mkArbSharePips sharePips)
+          acc  = totalA (PA.planAccrual phiXa phiMa plan4k path)
+          (PayoffX96 lvrN, PayoffX96 net) = PA.netAccrual acc
+      in  (PA.feesTrans acc, PA.feesArb acc, PA.lvrGross acc, lvrN, net)
+    sharesA = [0, 100000 .. 1000000] :: [Integer]            -- pips, uint24
+    bySh = [ (s, rowFor 20 s) | s <- sharesA ]
+    stepsA = [5, 10, 20, 40, 60, 80, 120, 160, 240] :: [Int]
+    bySt = [ (toInteger st, rowFor st 500000) | st <- stepsA ]
+    pick f xs = [ (x, f r) | (x, r) <- xs ]
+    s1 (a,_,_,_,_) = a; s2 (_,b,_,_,_) = b; s3 (_,_,c,_,_) = c; s4 (_,_,_,d,_) = d; s5 (_,_,_,_,e) = e
+  writePanel
+    "outputs/Payoffs/Accrual/panel-accrual-vs-arbshare.png"
+    (Beside
+      (Cell (PA.linesLayout "4-leg accrual vs [ν_arb/ν] (step 20 ticks, 400 steps, φ_X=5bp φ_M=30bp)" "[ν_arb/ν] (pips, 1e6 = 1)" "PayoffX96 (token1)"
+        [("fees_trans", pick s1 bySh), ("fees_arb", pick s2 bySh), ("LVR_gross", pick s3 bySh)]))
+      (Cell (PA.linesLayout "net: LVR_net = LVR_gross − fees_arb;  π^φ = fees_trans − LVR_net" "[ν_arb/ν] (pips, 1e6 = 1)" "PayoffX96 (token1)"
+        [("LVR_net", pick s4 bySh), ("π^φ (seller net)", pick s5 bySh)]))
+    )
+  writePanel
+    "outputs/Payoffs/Accrual/panel-accrual-vs-vol.png"
+    (Beside
+      (Cell (PA.linesLayout "4-leg accrual vs step size (vol proxy), share 500000 pips" "step (ticks)" "PayoffX96 (token1)"
+        [("fees_trans", pick s1 bySt), ("fees_arb", pick s2 bySt), ("LVR_gross", pick s3 bySt)]))
+      (Cell (PA.linesLayout "LVR_net crosses zero where the step exceeds the fee band" "step (ticks)" "PayoffX96 (token1)"
+        [("LVR_net", pick s4 bySt), ("π^φ (seller net)", pick s5 bySt)]))
+    )
+
+  -- TODO #28.1 evidence: tick-quantized log (pre-#64, staircase) vs continuous
+  -- lnQ96 on ±30 ticks, and their difference (bounded by ½ ln λ · Q96).
+  let
+    logCfg = SqrtPlot
+      { plotTitle  = "ln(p/p*) in Q96: tick-quantized (nakedLogTickQ96) vs continuous (lnQ96)"
+      , xAxisTitle = "sqrtPriceX96"
+      , yAxisTitle = "PayoffX96"
+      , xMin       = sqrtPriceX96 (-30)
+      , xMax       = sqrtPriceX96 30
+      }
+    logDiffCfg = retitleSqrt logCfg "difference: tick − continuous (sawtooth, |·| ≤ ½ ln λ · Q96)" "PayoffX96"
+    tickLog p = nakedLogTickQ96 p hopBAtm
+    contLog p = nakedLogQ96 p hopBAtm
+    logDiff p = let PayoffX96 a = tickLog p; PayoffX96 b = contLog p in PayoffX96 (a - b)
+  writePanel
+    "outputs/Payoffs/Replica/panel-log-tick-vs-continuous.png"
+    (Beside
+      (Cell (sqrtFunctionLayout logCfg PayoffY [("tick-quantized", tickLog), ("continuous lnQ96", contLog)]))
+      (Cell (sqrtFunctionLayout logDiffCfg PayoffY [("tick − continuous", logDiff)]))
+    )
+
   writePanel
     "outputs/Payoffs/variance-portfolio-vs-gammaCoordinate.png"
     (Cell
