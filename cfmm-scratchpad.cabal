@@ -29,47 +29,60 @@ library
       Greeks.Gamma
       Greeks.Theta
       Greeks.Vega
+      Hedge.Ledger
       Lib
       Liquidity.LiquidityChunk
       Liquidity.LiquidityDensity
       Liquidity.LiquidityGrid
       Liquidity.TickLiquidity
       OptionRatio
+      Panoptic.Binning
+      Panoptic.LegChunk
+      Panoptic.MintPlan
+      Panoptic.NId
       Payoffs.CashSecuredPut
+      Payoffs.CLMMPosition
       Payoffs.CoveredCall
-      Payoffs.CPMMPosition
       Payoffs.Forward
+      Payoffs.HolderPath
+      Payoffs.LadderPosition
       Payoffs.Linear
       Payoffs.Log
-      Payoffs.MintPlan
-      Payoffs.NId
+      Payoffs.LvrRate
+      Payoffs.PathAccrual
       Payoffs.Payoff
-      Payoffs.PlotInterest
-      Payoffs.PlotSqrt
       Payoffs.RangeAccrualNote
+      Payoffs.ReplicaDelta
       Payoffs.Return
       Payoffs.Savings
       Payoffs.Swap
-      Payoffs.TargetVega
       Payoffs.TransactionalFeeCapture
+      Payoffs.TransactionalReturn
       Payoffs.VariancePortfolio
       Payoffs.VolatilityCall
-      PlotUtils
+      Payoffs.VolatilityReplica
+      Plotting.PlotInterest
+      Plotting.PlotSqrt
+      Plotting.PlotUtils
       Pricing.AdaptiveStremia
       Pricing.ExpectedReturn
       Pricing.FeeStructure
       Pricing.InterestPriceMap
       Pricing.InterestSqrt
+      Pricing.MarkUpStructure
       Pricing.PriceDeformation
       Pricing.Stremia
       SqrtGrid
       State
       StrikeX96
+      TargetVega
       TickPath
       Trading.KappaCoordinate
       Trading.PriceImpact
       Trading.Quote
       Volatility.CevField
+      Volatility.ExpectedVolatility
+      Volatility.ImpliedVolatility
       Volatility.TickVolatility
       Volatility.VolatilityGrid
       Volatility.VolOrder
@@ -119,7 +132,7 @@ test-suite cfmm-scratchpad-test
       Paths_cfmm_scratchpad
   hs-source-dirs:
       test
-  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N -Wno-name-shadowing -Wno-type-defaults -Wno-gadt-mono-local-binds
   build-depends:
       Chart
     , Chart-cairo

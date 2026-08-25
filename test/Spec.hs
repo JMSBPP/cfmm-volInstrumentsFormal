@@ -7,7 +7,7 @@ import Control.Exception (ErrorCall, evaluate, try)
 
 import Greeks.Gamma (Gamma(..), cpmmGamma)
 import Graphics.Rendering.Chart.Easy (execEC, layout_title, (.=))
-import PlotUtils (Panel(..), canvasSize)
+import Plotting.PlotUtils (Panel(..), canvasSize)
 import OptionRatio (OptionRatio(..))
 import Payoffs.Payoff (squareSqrtPrice)
 import qualified Payoffs.Payoff as Payoff
@@ -17,13 +17,14 @@ import Payoffs.Return
   , returnPipsScale
   , unReturnPips
   )
-import Payoffs.NId
+import Panoptic.NId
   ( MintPlan(..)
   , PanopticTokenId(..)
   , fourLegNumLegs
   , fourLegSkeleton
   , mkNId
   , nSigma
+  , panopticAsset
   , panopticIsLong
   , panopticOptionRatio
   , panopticStrike
@@ -41,8 +42,9 @@ import Payoffs.Forward
   , nakedForwardQ96
   )
 import qualified Payoffs.Forward as Fwd
-import Payoffs.Log (logContract, nakedLogQ96)
+import Payoffs.Log (lnQ96, lnWad, logContract, logPortfolioQ96, nakedLogQ96, nakedLogTickQ96, pattern WAD)
 import qualified Payoffs.Log as PLog
+import qualified Payoffs.VariancePortfolio as VPort
 import Payoffs.VariancePortfolio
   ( fromDef6
   , fromLegs
@@ -51,7 +53,7 @@ import Payoffs.VariancePortfolio
   , variancePortfolioLayoutVsGamma
   , variancePortfolioLayoutVsXi
   )
-import Payoffs.TargetVega
+import TargetVega
   ( mkTargetVega
   , positionSizeForTargetVega
   , targetVegaFromMint
@@ -64,6 +66,10 @@ import Liquidity.LiquidityChunk
   , chunkTickUpper
   , createChunk
   , unLiquidityChunk
+  , chunkAmount0
+  , chunkAmount1
+  , unitChunk
+  , unitLiquidity
   )
 import Liquidity.TickLiquidity
   ( TickLiquidity(..)
@@ -121,6 +127,10 @@ import Pricing.FeeStructure
   , mkFeeStructure
   , toFeePips
   )
+import Pricing.MarkUpStructure
+  ( MarkUpStructure(foldMarkUpFactor, markUpFactors)
+  , TwoSidedMarkUp(markupPhiX, markupPhiM)
+  )
 import Pricing.ExpectedReturn
   ( ExpectedReturn(..)
   , ReturnFromKappa(..)
@@ -146,9 +156,11 @@ import Payoffs.TransactionalFeeCapture
   ( TransactionalFeeCapture(..)
   , assertAccountingIdentityWithSwap
   , feeFactorX96
+  , feeRevenueExpectedReturn
   , payPartitionErrorX96
   , recvPartitionErrorX96
   , runFeeCaptureAlongTenor
+  , runFeeCaptureAlongTenorMixture
   , transactionalFeeCaptureFromFeeStructure
   )
 import Pricing.InterestSqrt
@@ -184,6 +196,7 @@ import SqrtGrid
   , SqrtPriceX96(..)
   , Tick
   , integerSqrt
+  , mulDiv
   , invX96
   , mkTickSpacing
   , mulX96
@@ -197,9 +210,25 @@ import SqrtGrid
   )
 import State (pattern SQRT_PRICE_1_4, pattern SQRT_PRICE_4_1)
 import StrikeX96 (StrikeX96(..))
+import qualified Payoffs.CLMMPosition as CLMM
+import Payoffs.CLMMPosition (clmmChunk)
+import Panoptic.LegChunk (legChunk, legChunks, legLiquidity)
+import Payoffs.VolatilityReplica (ErrorX96(..), fourLegReplica, legMintValue, replicaError, windowTicks)
+import Greeks.Delta (PayoffDelta(..), PriceDeltaX96(..), deltaOfPayoff)
+import Payoffs.ReplicaDelta (replicaDelta)
+import Payoffs.HolderPath (HolderReport(..), Regime(..), arbShare, arbShareToken1, composedPath, hedgeAlong, holderPnL, pathEndTicks, trianglePath)
+import Payoffs.LvrRate (chi, lvrRateOn, lvrRateTable, naiveBandTicks, rationalBandTicks)
+import Payoffs.ReplicaDelta (principalDelta)
+import Payoffs.TransactionalReturn (TransTurnover(..), measuredFeeReturn, refTransactionalReturn, transTurnover)
+import Payoffs.Return (ReturnPips(..))
+import Hedge.Ledger (HolderSwap(..), Ledger(..), RebateX96(..), emptyLedger, hedgeStep, ledgerInvariant, payStreamia, qualifying)
+import Panoptic.Binning (binNotionals, binToLegs, ladderFromVolOrder, mintPlanFromLadder, quantizationReport, QuantizationRow(..))
+import qualified Payoffs.PathAccrual as PA
+import Payoffs.LadderPosition
+  ( cOfS, hedgedRung, ladderChunks, ladderFromSpan, ladderN1, ladderReturnQ96, ladderT1 )
 import Data.Vector ((!))
 import qualified Data.Vector as V
-import TickPath (TickPath(..), mkTickPath)
+import TickPath (TickPath(..), mkTickPath, pathLength, ticks)
 import Payoffs.VolatilityCall
   ( mkVolStrike
   , payoff
@@ -224,8 +253,21 @@ import Volatility.TickVolatility
   , VolatilityAverage(..)
   , averageVolatility
   , rangeAlongPath
+  , unVolatilityAverage
   , volatilityOnRange
   )
+import Volatility.ExpectedVolatility
+  ( ExpectedVolatility(..)
+  , expectedVolatilityUniformTenor
+  , expectedVolatilityWindowStub
+  , realizedVolatilityFromAverage
+  , tenorTickPath
+  , unExpectedVolatility
+  , unRealizedVolatility
+  , unVolGap
+  , volGap
+  )
+import Volatility.ImpliedVolatility (impliedVolatilityFromAverage)
 import Volatility.VolatilityGrid (gammaCoordinate)
 
 assertThrows :: forall a. String -> a -> IO ()
@@ -323,7 +365,11 @@ main = do
     expectedLog =
       floor (fromIntegral Q96 * fromIntegral (i10 - i0) * log tickBase)
     PayoffX96 log10 = nakedLogQ96 s10 atm0
-  assertEqual "naked log is (i-i*) ln λ in Q96" expectedLog log10
+  -- TODO #28.1: continuous log agrees with the tick formula AT a tick price
+  -- (both are 10·ln λ here); tolerance covers lnWad approx + Double floor.
+  if abs (log10 - expectedLog) <= Q96 `div` 1000000000
+    then putStrLn "ok: naked log ≈ (i-i*) ln λ at a tick price (1e-9 Q96)"
+    else error ("naked log vs tick formula: " ++ show log10 ++ " vs " ++ show expectedLog)
   let SqrtPriceX96 word10 = s10
   if log10 == word10
     then error "log must not be ln of the Q96 word"
@@ -334,6 +380,42 @@ main = do
     (let PayoffX96 y = PLog.payoff n32 s10 atm0 in y)
   _ <- evaluate (logContract n32 atm0)
   putStrLn "ok: logContract Payoff"
+
+  -- TODO #28.1: lnWad port + lnQ96 properties.
+  assertEqual "lnWad(WAD) = 0" 0 (lnWad WAD)
+  let e18 = 2718281828459045235 :: Integer  -- e·WAD (floor)
+  if abs (lnWad e18 - WAD) <= 10 then putStrLn "ok: lnWad(e) = WAD ± 10 wei"
+    else error ("lnWad(e) = " ++ show (lnWad e18))
+  if abs (lnWad (2 * WAD) - 693147180559945309) <= 10 then putStrLn "ok: lnWad(2) ± 10 wei"
+    else error ("lnWad(2) = " ++ show (lnWad (2 * WAD)))
+  if abs (lnWad (WAD `div` 2) + 693147180559945309) <= 10 then putStrLn "ok: lnWad(1/2) ± 10 wei"
+    else error ("lnWad(1/2) = " ++ show (lnWad (WAD `div` 2)))
+  -- monotone on a log-spaced grid
+  let grid = [ WAD * k `div` 100 | k <- [1 .. 99] ] ++ [ WAD * k | k <- [1 .. 1000] ]  -- strictly increasing, no duplicates
+  if and (zipWith (<) (map lnWad grid) (map lnWad (drop 1 grid)) ) then putStrLn "ok: lnWad monotone"
+    else error "lnWad not monotone"
+  -- lnQ96 vs tick log at every 10th tick on ±3000: measured max |diff| ≤ ½ ln λ · Q96 (tick error)
+  let halfTickErr = floor (0.5 * log tickBase * fromIntegral Q96 :: Double) + Q96 `div` 1000000 :: Integer
+      diffs = [ abs (a - b)
+              | i <- [-3000, -2990 .. 3000]
+              , let PayoffX96 a = nakedLogQ96 (sqrtPriceX96 i) atm0
+              , let PayoffX96 b = nakedLogTickQ96 (sqrtPriceX96 i) atm0 ]
+  if maximum diffs <= halfTickErr then putStrLn ("ok: lnQ96 vs tick log, max diff " ++ show (maximum diffs) ++ " ≤ ½ ln λ Q96")
+    else error ("lnQ96 vs tick log max diff " ++ show (maximum diffs) ++ " > " ++ show halfTickErr)
+  -- lnQ96 vs Double reference (plot boundary): measured max relative error, reported
+  let refErr = maximum
+        [ abs (fromIntegral a - 2 * log (fromIntegral p / fromIntegral Q96) * fromIntegral Q96) / fromIntegral Q96
+        | i <- [-3000, -2990 .. 3000], i /= 0
+        , let SqrtPriceX96 p = sqrtPriceX96 i
+        , let PayoffX96 a = lnQ96 (SqrtPriceX96 p) (sqrtPriceX96 0) ] :: Double
+  if refErr <= 1.0e-12 then putStrLn ("ok: lnQ96 vs Double ln, max abs err " ++ show refErr ++ " (Q96 units)")
+    else error ("lnQ96 vs Double ln err " ++ show refErr)
+  -- continuity: strictly increasing across a sub-tick step
+  let SqrtPriceX96 s0 = sqrtPriceX96 0
+      PayoffX96 lA = lnQ96 (SqrtPriceX96 (s0 + s0 `div` 100000)) (sqrtPriceX96 0)
+      PayoffX96 lB = lnQ96 (SqrtPriceX96 (s0 + s0 `div` 50000)) (sqrtPriceX96 0)
+  if 0 < lA && lA < lB then putStrLn "ok: lnQ96 continuous below one tick (no sawtooth)"
+    else error "lnQ96 not increasing within a tick"
 
   let
     remaining = PayoffX96 1000
@@ -348,6 +430,14 @@ main = do
     yLegs10 = Payoff.runPayoff (toPayoff piLegs) s10
     yDef10 = Payoff.runPayoff (toPayoff piDef6) s10
   assertEqual "fromLegs = fromDef6 off ATM" yLegs10 yDef10
+  -- TODO #29: single T0 definition — fromLegs = N_id·logPortfolioQ96 + R, exactly, at several ticks
+  sequence_
+    [ assertEqual ("T0 single definition at tick " ++ show i) (scaleByNId n32 lp + rRaw) y
+    | i <- [-3000, -700, -10, 10, 700, 3000]
+    , let p = sqrtPriceX96 i
+    , let PayoffX96 lp = logPortfolioQ96 p (Fwd.unAtmForward atm0)
+    , let PayoffX96 rRaw = remaining
+    , let PayoffX96 y = Payoff.runPayoff (VPort.toPayoff (fromLegs n32 atm0 remaining)) p ]
 
   assertThrows "mkTargetVega 0 rejected" (mkTargetVega 0)
   assertThrows "mkTargetVega (-1) rejected" (mkTargetVega (-1))
@@ -381,6 +471,8 @@ main = do
   mapM_
     (\leg -> do
       assertEqual ("isLong leg " ++ show leg) 1 (panopticIsLong skeleton leg)
+      -- TODO #28 item 0: asset bit (TokenId bit 64+48·leg) = 1 on every leg — single token1 basis
+      assertEqual ("asset leg " ++ show leg) 1 (panopticAsset skeleton leg)
       assertEqual ("width leg " ++ show leg) 1 (panopticWidth skeleton leg)
     )
     [0, 1, 2, 3]
@@ -650,6 +742,55 @@ main = do
     (V.replicate 7 (RangeVolatility 0))
     constantRanges
 
+  -- ExpectedVolatility Slice 1
+  let volAvg0 = VolatilityAverage 0
+  assertEqual
+    "realizedVolatilityFromAverage round-trip"
+    0
+    (unRealizedVolatility (realizedVolatilityFromAverage volAvg0))
+  assertEqual
+    "expectedVolatilityWindowStub = realized (Slice 1 stub)"
+    0
+    (unExpectedVolatility (expectedVolatilityWindowStub volAvg0))
+  let
+    ipmTen = mkInterestPriceMap 1 0
+    t0Vol = mkInterestTick 0
+    t7Vol = mkInterestTick 7
+    flatPathVol = TickPath 8 (V.replicate 8 0)
+    evFlat = expectedVolatilityUniformTenor ipmTen t0Vol t0Vol
+    path07 = tenorTickPath ipmTen t0Vol t7Vol
+  assertEqual
+    "tenorTickPath t0→t7 length"
+    8
+    (pathLength path07)
+  assertEqual
+    "tenorTickPath t0 tick"
+    0
+    (ticks path07 ! 0)
+  assertEqual
+    "tenorTickPath t7 tick"
+    7
+    (ticks path07 ! 7)
+  assertEqual
+    "uniform tenor flat t0=t0 ⇒ σ^e=0"
+    0
+    (unExpectedVolatility evFlat)
+  assertEqual
+    "uniform tenor flat matches averageVolatility constant path"
+    (unVolatilityAverage (averageVolatility flatPathVol))
+    (unExpectedVolatility (expectedVolatilityUniformTenor ipmTen t0Vol t0Vol))
+  let
+    ivGap = impliedVolatilityFromAverage (VolatilityAverage 100)
+    evGap = ExpectedVolatility 40
+  assertEqual
+    "volGap σ_IV − σ^e"
+    60
+    (unVolGap (volGap ivGap evGap))
+  assertEqual
+    "volGap zero when equal"
+    0
+    (unVolGap (volGap ivGap (ExpectedVolatility 100)))
+
   let
     bookPath = TickPath 8 (V.generate 8 (\x -> x * 10))
     bookRanges = rangeAlongPath bookPath
@@ -819,6 +960,284 @@ main = do
       hopBIota
     )
   putStrLn "ok: hop B Π vs-gamma / vs-xi layouts"
+
+  -- TODO #24 / #35 / #27: per-tick CLMM identity (README MODEL_CLOSURE).
+  -- Every CLMMPosition is built from a chunk.  fromChunk (Id_i) equals the
+  -- unit position fromCall k½ r (chunk with amount0 = 1 token0 at the same
+  -- ticks) scaled by amount0(Id_i), for every p below / in / above the range,
+  -- with k½ = √(p^bid p^ask), r = p^ask/p^bid the SQRT-price ratio.
+  -- The scale is per (i, Δ_i) — the unit chunk's token0 amount — not per Δ_i.
+  let identityAt i di p =
+        let ch   = unitChunk i (mkTickSpacing di)
+            SqrtPriceX96 a = sqrtPriceX96 i
+            SqrtPriceX96 b = sqrtPriceX96 (i + di)
+            kRaw = floor (sqrt (fromInteger a * fromInteger b :: Double)) :: Integer
+            r    = fromInteger b / fromInteger a :: Double
+            unit = CLMM.fromCall (StrikeX96 kRaw) (OptionRatio r)
+            PayoffX96 lhs = Payoff.runPayoff (CLMM.toPayoff (CLMM.fromChunk ch)) p
+            PayoffX96 uy  = Payoff.runPayoff (CLMM.toPayoff unit) p
+            PayoffX96 am0 = chunkAmount0 ch
+            rhs  = (am0 * uy) `div` Q96
+            tol  = max 1 (abs rhs `div` 1000000)  -- 1e-6 rel; X96 floors
+            PayoffX96 unitAm0 = chunkAmount0 (clmmChunk unit)
+        in  if abs (lhs - rhs) <= tol
+               && chunkTickLower (clmmChunk unit) == i
+               && chunkTickUpper (clmmChunk unit) == i + di
+               && abs (unitAm0 - Q96) <= Q96 `div` 1000000
+              then pure ()
+              else error ("CLMM identity fails at i=" ++ show i ++ " Δ=" ++ show di
+                          ++ " p=" ++ show p ++ ": lhs=" ++ show lhs ++ " rhs=" ++ show rhs
+                          ++ " unitAm0=" ++ show unitAm0)
+  sequence_
+    [ identityAt i di (sqrtPriceX96 (i + off))
+    | (i, di) <- [(0, 10), (0, 60), (-3000, 200), (40000, 10), (-120000, 60)]
+    , off <- [-di, -1, 0, 1, di `div` 2, di - 1, di, di + 1, 3 * di]
+    ]
+  -- Out-of-range values of the chunk position are its token amounts (1e-6 rel).
+  let ch0 = unitChunk 0 (mkTickSpacing 60)
+      PayoffX96 am1 = chunkAmount1 ch0
+      PayoffX96 hi  = Payoff.runPayoff (CLMM.toPayoff (CLMM.fromChunk ch0)) (sqrtPriceX96 600)
+  if abs (hi - am1) <= max 1 (am1 `div` 1000000) then pure ()
+    else error ("fromChunk above range /= amount1: " ++ show hi ++ " vs " ++ show am1)
+  putStrLn "ok: per-tick CLMM identity fromChunk = amount0 · unit fromCall"
+  -- Lean LadderPrincipal.principal_inRange (P2): in range, principal(L,a,b,p)
+  -- = amount1(L,a,p) + p²·amount0(L,p,b) — the Uniswap split at the current price.
+  -- Regression at interior ticks (chunks split at tick m).
+  sequence_
+    [ if abs (lhs - rhs) <= max 1 (abs rhs `div` 1000000) then pure ()
+        else error ("principal_inRange fails at i=" ++ show i ++ " m=" ++ show m ++ ": " ++ show lhs ++ " vs " ++ show rhs)
+    | (i, di) <- [(0, 60), (-3000, 200), (40000, 60)]
+    , m <- [i + 10, i + di `div` 2, i + di - 10]
+    , let ch = unitChunk i (mkTickSpacing di)
+    , let p@(SqrtPriceX96 pRaw) = sqrtPriceX96 m
+    , let PayoffX96 lhs = Payoff.runPayoff (CLMM.toPayoff (CLMM.fromChunk ch)) p
+    , let PayoffX96 am1 = chunkAmount1 (createChunk i m unitLiquidity)
+    , let PayoffX96 am0 = chunkAmount0 (createChunk m (i + di) unitLiquidity)
+    , let rhs = am1 + mulDiv (mulDiv pRaw pRaw Q96) am0 Q96
+    ]
+  putStrLn "ok: principal_inRange (Lean P2) = amount1(a,p) + p²·amount0(p,b)"
+
+  -- ===== TODO #28.2 — T1 ladder: regressions of README § REPLICATION_THEORY =====
+  let
+    vegaL  = mkTargetVega (10 ^ (24 :: Int))
+    spL    = mkTickSpacing 10
+    lad    = ladderFromSpan (-2000) 2000 spL 0 vegaL           -- S = 4000, ι = 400, strike at midpoint
+    chunksL = ladderChunks lad
+    pStarL = sqrtPriceX96 0
+    PayoffX96 n1 = ladderN1 lad
+  assertEqual "ladder has ι = S/Δ rungs" 400 (length chunksL)
+  -- Theorem 7(i): ℓ(ξ*, ι; x) equals the normalized sampled K^{-1/2} profile (Q96, 1e-9 rel)
+  let
+    iotaL = mkLadderResolution 400
+    samples = [ (Q96 * Q96) `div` raw | x <- [0 .. 399], let SqrtPriceX96 raw = sqrtPriceX96 (-2000 + 10 * x) ]
+    total = sum samples
+    worst = maximum [ abs (fromIntegral (unLiquidityDensityX96 (ell (xiStar spL) iotaL x)) - fromIntegral (samples !! x) * fromIntegral Q96 / fromIntegral total) / fromIntegral Q96
+                    | x <- [0 .. 399] ] :: Double
+  if worst <= 1.0e-9 then putStrLn ("ok: Thm 7(i) ℓ(ξ*) = normalized K^{-1/2} samples, max err " ++ show worst)
+    else error ("Thm 7(i) fails: " ++ show worst)
+  -- Theorem 9: h_x(p*) = 0 on every rung; h_x ≥ 0 on a grid (X96 floors: 1e6 wei ≈ 1e-12 of the unit chunk)
+  let tolW = 1000000 :: Integer
+  sequence_
+    [ if abs h0 <= tolW && all (>= negate tolW) hs then pure ()
+        else error ("Thm 9 fails at rung " ++ show (chunkTickLower ch) ++ ": h(p*)=" ++ show h0 ++ " min h=" ++ show (minimum hs))
+    | ch <- chunksL
+    , let PayoffX96 h0 = hedgedRung 0 ch pStarL
+    , let hs = [ y | i <- [-3000, -2500 .. 3000], let PayoffX96 y = hedgedRung 0 ch (sqrtPriceX96 i) ]
+    ]
+  putStrLn "ok: Thm 9 hedged rung = 0 at p*, ≥ 0 (400 rungs × 13 prices)"
+  -- Theorem 10: T1/N_1 ≈ c(S)·logPortfolio, S = 4000 → c = 2.62294; exclusion band |i| < 2Δ
+  let
+    cS = cOfS 4000
+    relErrs = [ abs (fromIntegral t1r - cS * fromIntegral lp) / (cS * fromIntegral lp)
+              | i <- [-1800, -1500 .. 1800], abs i >= 20
+              , let p = sqrtPriceX96 i
+              , let PayoffX96 t1r = ladderReturnQ96 lad p
+              , let PayoffX96 lp  = logPortfolioQ96 p pStarL ] :: [Double]
+  if abs (cS - 2.62294) < 2.0e-5 then putStrLn ("ok: c(4000) = " ++ show cS ++ " (Lean 2.62294)")
+    else error ("c(4000) = " ++ show cS)
+  if maximum relErrs <= 5.0e-3 then putStrLn ("ok: Thm 10 T1/N_1 vs c(S)·logPortfolio, max rel err " ++ show (maximum relErrs) ++ " at Δ=10")
+    else error ("Thm 10 fails: max rel err " ++ show (maximum relErrs))
+  -- Proposition 1: residual shrinks ~O(Δ²): Δ = 200 → 20 should cut the spread by ≥ 20× (100× nominal)
+  let
+    spreadAt d =
+      let ld = ladderFromSpan (-2000) 2000 (mkTickSpacing d) 0 vegaL
+          rs = [ fromIntegral t1r / fromIntegral lp
+               | i <- [-1800, -1500 .. 1800], abs i >= 2 * d
+               , let p = sqrtPriceX96 i
+               , let PayoffX96 t1r = ladderReturnQ96 ld p
+               , let PayoffX96 lp  = logPortfolioQ96 p pStarL ] :: [Double]
+      in  (maximum rs - minimum rs) / cS
+    s200 = spreadAt 200
+    s20  = spreadAt 20
+  if s200 / s20 >= 20 then putStrLn ("ok: Prop 1 spread ratio Δ200/Δ20 = " ++ show (s200 / s20) ++ " (≥ 20; O(Δ²) nominal 100)")
+    else error ("Prop 1 fails: spreads " ++ show (s200, s20))
+  _ <- evaluate (Payoff.runPayoff (ladderT1 lad) pStarL)
+  if n1 > 0 then putStrLn "ok: N_1 > 0" else error "N_1 <= 0"
+
+  -- ===== TODO #28.3 — 𝓑 binning (Corollary 1) and e^σ_W =====
+  let
+    voWide  = mkVolOrder (mkVolRangeWidth 4000 (mkTickSpacing 10)) (mkVolStrike Q96) (mkVolSkew 32768) vegaL
+    ladW    = ladderFromVolOrder voWide
+    ns      = binNotionals ladW voWide
+    ((o0, o1, o2, o3), psW) = binToLegs 8 ladW voWide
+    orsW    = [o0, o1, o2, o3]
+    planB   = mintPlanFromLadder 0 ladW voWide
+    legsB   = legChunks planB
+  assertEqual "wide VolOrder legs" [(-2000, -1000), (-1000, 0), (0, 1000), (1000, 2000)] (legIntervals voWide)
+  assertEqual "max or = 127" 127 (maximum orsW)
+  -- Corollary 1 round-trip (spec test g): or·positionSize = n_leg within 1/(2·or); max leg < 127 wei
+  sequence_
+    [ if abs (o * unTargetVega psW - n) <= max 127 (n `div` (2 * o)) then pure ()
+        else error ("round-trip fails leg " ++ show leg ++ ": " ++ show (o, unTargetVega psW, n))
+    | (leg, o, n) <- zip3 [0 :: Int ..] orsW ns ]
+  putStrLn ("ok: Cor 1 round-trip or·positionSize = n_leg (1/(2·or)); or = " ++ show orsW)
+  -- Theorem 8: realized leg liquidity (legLiquidity) = c-weighted mean of the rungs in the bin
+  sequence_
+    [ if abs (lLeg - lMean) <= max 1 (lMean `div` (2 * o)) then pure ()
+        else error ("Thm 8 mean fails leg " ++ show leg ++ ": " ++ show (lLeg, lMean))
+    | (leg, (lo, hi), o) <- zip3 [0 :: Int ..] (legIntervals voWide) orsW
+    , let lLeg = chunkLiquidity (legsB !! leg)
+    , let rungs = [ ch | ch <- ladderChunks ladW, let i = chunkTickLower ch, lo <= i && i < hi ]
+    , let cs = [ b - a | ch <- rungs, let SqrtPriceX96 a = sqrtPriceX96 (chunkTickLower ch), let SqrtPriceX96 b = sqrtPriceX96 (chunkTickLower ch + 10) ]
+    , let lMean = sum (zipWith (*) (map chunkLiquidity rungs) cs) `div` sum cs ]
+  putStrLn "ok: Thm 8 legLiquidity = c-weighted mean of the rungs (4 legs)"
+  -- (h) computed or beats the fixture (1,2,3,4) in e^σ_W on W (stride 50)
+  let
+    wW = windowTicks voWide 50
+    planFix = MintPlan (volOrderToTokenId voWide 0 (1, 2, 3, 4)) (mintChunk planB)
+    ErrorX96 eB   = replicaError ladW planB wW
+    ErrorX96 eFix = replicaError ladW planFix wW
+  if eB < eFix then putStrLn ("ok: (h) e^σ_W: 𝓑 = " ++ show (fromIntegral eB / fromIntegral Q96 :: Double) ++ " < fixture (1,2,3,4) = " ++ show (fromIntegral eFix / fromIntegral Q96 :: Double))
+    else error ("(h) fails: " ++ show (eB, eFix))
+  -- quantization report: bound holds per leg
+  let rows = quantizationReport ladW voWide
+  sequence_ [ if qRelErrPpm r <= qBoundPpm r + 1 then pure () else error ("quantization bound fails: " ++ show r) | r <- rows ]
+  putStrLn ("ok: quantization report " ++ show [ (qOr r, qRelErrPpm r, qBoundPpm r) | r <- rows ])
+
+  -- ===== TODO #30 — path accrual: fees and LVR per chunk along a tagged path =====
+  let
+    phiXp = mkFeePips 500      -- 5 bp on token0 (down moves)
+    phiMp = mkFeePips 3000     -- 30 bp on token1 (up moves)
+    chA   = createChunk (-500) 500 (10 ^ (24 :: Int))
+    shareOf s = PA.mkArbSharePips (s * PA.PIPS_ONE `div` 100)
+    pathAt s = PA.syntheticPath 7 0 20 400 (shareOf s)
+    accAt s = PA.pathAccrual phiXp phiMp chA (pathAt s)
+    nArb s = length [ () | PA.Step _ _ PA.Arb <- pathAt s ]
+  assertEqual "share 0 → no arb steps" 0 (nArb 0)
+  assertEqual "share 100 → all arb steps" 400 (nArb 100)
+  assertEqual "share 25 → 100 arb steps (Bresenham)" 100 (nArb 25)
+  -- LVR ≥ 0 on every arb step (concavity, Thm 5); zero at share 0
+  sequence_ [ if PA.lvrGross (PA.stepAccrual phiXp phiMp chA st) >= 0 then pure () else error ("negative LVR on " ++ show st) | st <- pathAt 100 ]
+  assertEqual "LVR = 0 at share 0" 0 (PA.lvrGross (accAt 0))
+  if PA.lvrGross (accAt 100) > 0 then putStrLn "ok: LVR > 0 at share 100" else error "no LVR at share 100"
+  -- total fees independent of tagging (same path, same fees; only the split moves)
+  let totalFees s = PA.feesTrans (accAt s) + PA.feesArb (accAt s)
+  assertEqual "total fees independent of tagging" (totalFees 0) (totalFees 100)
+  assertEqual "total fees independent of tagging (50)" (totalFees 0) (totalFees 50)
+  -- monotone in the share: LVR ↑, fees_trans ↓
+  let shares = [0, 25, 50, 75, 100]
+      lvrs = [ PA.lvrGross (accAt s) | s <- shares ]
+      fts  = [ PA.feesTrans (accAt s) | s <- shares ]
+  if and (zipWith (<=) lvrs (drop 1 lvrs)) && and (zipWith (>=) fts (drop 1 fts))
+    then putStrLn ("ok: LVR monotone ↑, fees_trans ↓ in arb share: " ++ show (zip shares lvrs))
+    else error ("monotonicity fails: " ++ show (lvrs, fts))
+  -- a single up-step: fee = φ_M·amount1, LVR = amount0·p_j² − amount1 > 0
+  let PA.Accrual _ fa1 lg1 = PA.stepAccrual phiXp phiMp chA (PA.Step 0 20 PA.Arb)
+      SqrtPriceX96 a0 = sqrtPriceX96 0
+      SqrtPriceX96 a20 = sqrtPriceX96 20
+      amt1 = mulDiv (10 ^ (24 :: Int)) (a20 - a0) Q96
+  assertEqual "up-step fee = φ_M·amount1" (mulDiv amt1 3000 1000000) fa1
+  if lg1 > 0 && lg1 < amt1 `div` 100 then putStrLn ("ok: up-step LVR small positive: " ++ show lg1 ++ " vs amount1 " ++ show amt1)
+    else error ("up-step LVR " ++ show lg1)
+  -- four-leg roll-up and net accrual sign: seller net = fees_trans − LVR_net
+  let accs = PA.planAccrual phiXp phiMp planB (PA.syntheticPath 11 0 20 400 (shareOf 50))
+      (PayoffX96 lvrN, PayoffX96 netS) = PA.netAccrual (foldr addAccrualT zeroT accs)
+      addAccrualT (PA.Accrual x y z) (PA.Accrual x' y' z') = PA.Accrual (x + x') (y + y') (z + z')
+      zeroT = PA.Accrual 0 0 0
+  assertEqual "plan accrual has 4 legs" 4 (length accs)
+  putStrLn ("ok: 4-leg net accrual at share 50: LVR_net = " ++ show lvrN ++ ", π^φ = " ++ show netS)
+  -- TODO #28 item 0: strike of a chunk position is the integer sqrt of a·b (no Double).
+  let chS = unitChunk 40000 (mkTickSpacing 60)
+      SqrtPriceX96 aS = sqrtPriceX96 40000
+      SqrtPriceX96 bS = sqrtPriceX96 40060
+      StrikeX96 kS = CLMM.chunkStrike chS
+  assertEqual "chunkStrike = integerSqrt(a·b)" (integerSqrt (aS * bS)) kS
+
+  -- TODO #25 (#36): four leg chunks 𝓛𝓒_leg from a MintPlan (≙ PanopticMath.getLiquidityChunk)
+  -- and the 4-leg replica π̂^σ = Σ_leg [ H_leg(p) − π^φ(𝓛𝓒_leg; p) ].
+  let
+    dqvBig   = mkTargetVega (10 ^ (18 :: Int))
+    voBig    = fixtureSymmetricVolOrder dqvBig
+    ratios4  = (1, 2, 3, 4)
+    planBig  = volOrderToMintPlan voBig 0 ratios4
+    chunks   = legChunks planBig
+    orOf leg = panopticOptionRatio (mintTokenId planBig) (toInteger leg)
+  assertEqual "legChunks ticks = legIntervals"
+    (legIntervals voBig)
+    [ (chunkTickLower c, chunkTickUpper c) | c <- chunks ]
+  assertEqual "legChunk leg = legChunks !! leg" (chunks !! 2) (legChunk planBig 2)
+  -- put legs (tokenType 0): token1 notional or(leg)·ΔQ_υ is the chunk's amount1;
+  -- call legs (tokenType 1): token0 notional or(leg)·ΔQ_υ is the chunk's amount0.
+  let relClose lbl want (PayoffX96 got) =
+        if abs (got - want) <= max 1 (want `div` 100000)
+          then pure ()
+          else error (lbl ++ ": want " ++ show want ++ " got " ++ show got)
+  -- TODO #28 item 0: asset = 1 on all legs (PanopticMath.getLiquidityChunk: asset==1 →
+  -- getLiquidityForAmount1), so or(leg)·ΔQ_υ is the token1 notional of EVERY leg.
+  sequence_
+    [ relClose ("leg " ++ show leg ++ " amount1 = or·ΔQ (asset=1)") (orOf leg * 10 ^ (18 :: Int)) (chunkAmount1 (chunks !! leg))
+    | leg <- [0 .. 3] ]
+  assertEqual "legLiquidity = chunkLiquidity" (chunkLiquidity (chunks !! 3)) (legLiquidity planBig 3)
+  -- Replica: zero at p* (all legs OTM), non-negative everywhere, and each leg's
+  -- mint value H_leg dominates its principal.
+  let
+    pStar   = sqrtPriceX96 0
+    replica = fourLegReplica planBig pStar
+    at p    = let PayoffX96 y = Payoff.runPayoff replica p in y
+  let tolRep = 10 ^ (9 :: Int)  -- 1e-9 of ΔQ_υ = 1e18; X96 floors between branches
+
+  -- TODO #33 (#86): Δ̂^σ = ∂_P π̂^σ (rebate note Def 12, test §5.1).  Closed form
+  -- (Payoffs.ReplicaDelta) vs the generic finite-difference Greeks.Delta instance,
+  -- 0 at p*, sign, nondecreasing (convexity of π̂^σ).
+  let
+    dHat   = runPayoffDelta (replicaDelta planBig)
+    dFD    = runPayoffDelta (deltaOfPayoff replica)
+    dAt f i = let PriceDeltaX96 d = f (sqrtPriceX96 i) in d
+    dH = dAt dHat
+    dF = dAt dFD
+    legEdges = concat [ [chunkTickLower c, chunkTickUpper c] | c <- chunks ]
+    interior i = all (\e -> abs (i - e) > 2) legEdges   -- bump ≈ 0.3 tick; stay > 2 ticks off kinks
+    relTol want got = abs (got - want) <= max (10 ^ (6 :: Int)) (abs want `div` 1000)  -- 1e-3 (bump curvature)
+  sequence_
+    [ if relTol (dH i) (dF i) then pure ()
+        else error ("replicaDelta /= finite difference at tick " ++ show i ++ ": " ++ show (dH i, dF i))
+    | i <- [-60, -40, -25, -17, -12, -7, -3, 3, 7, 12, 17, 25, 40, 60], interior i ]
+  if abs (dAt dHat 0) <= tolRep then putStrLn "ok: replicaDelta(p*) = 0"
+    else error ("replicaDelta(p*) /= 0: " ++ show (dAt dHat 0))
+  sequence_
+    [ if (i < 0 && dAt dHat i <= 0) || (i > 0 && dAt dHat i >= 0) then pure ()
+        else error ("replicaDelta sign wrong at tick " ++ show i)
+    | i <- [-60, -20, -5, 5, 20, 60] ]
+  let ticksMono = [-60, -55 .. 60] :: [Int]
+  if and (zipWith (\i j -> dAt dHat i <= dAt dHat j) ticksMono (drop 1 ticksMono))
+    then putStrLn "ok: replicaDelta nondecreasing (π̂^σ convex)"
+    else error "replicaDelta not nondecreasing"
+  if abs (at pStar) <= tolRep then putStrLn "ok: replica(p*) = 0 (X96 tol)"
+    else error ("replica(p*) /= 0: " ++ show (at pStar))
+  sequence_
+    [ if at p >= negate tolRep && hLeg + tolRep >= principal
+        then pure ()
+        else error ("replica negative or H < π^φ at tick " ++ show i)
+    | i <- [-60, -25, -20, -15, -10, -5, -1, 1, 5, 10, 15, 20, 25, 60]
+    , let p = sqrtPriceX96 i
+    , leg <- [0 .. 3]
+    , let PayoffX96 hLeg = legMintValue planBig leg p
+    , let PayoffX96 principal = Payoff.runPayoff (CLMM.toPayoff (CLMM.fromChunk (chunks !! leg))) p
+    ]
+  -- Convex in p around p*: replica grows away from p* on both sides.
+  if at (sqrtPriceX96 (-20)) > at (sqrtPriceX96 (-10)) && at (sqrtPriceX96 20) > at (sqrtPriceX96 10)
+    then pure () else error "replica not increasing away from p*"
+  putStrLn "ok: 4-leg chunks + replica π̂^σ (zero at p*, ≥ 0, growing away)"
   let
     i0 = 0 :: Tick
     i1 = 10 :: Tick
@@ -837,6 +1256,226 @@ main = do
             ++ show right
         )
     else putStrLn "ok: gammaCoordinate ratio Theorem 38"
+
+  -- TODO #34: hedge ledger (rebate note Defs 13–14, test §5.2): invariant, no double claim,
+  -- direction rule, cap at |Δ* − h|, budget cap.
+  let
+    phiH    = mkFeePips 3000
+    dHatPD  = replicaDelta planBig
+    led0    = payStreamia (10 ^ (15 :: Int)) emptyLedger          -- B_s = 1e-3 token1
+    p20     = sqrtPriceX96 20
+    dStar20 = dAt dHat 20                                          -- > 0 above p*
+    (led1, RebateX96 r1) = hedgeStep phiH dHatPD led0 (HolderSwap p20 dStar20)
+    (led2, RebateX96 r2) = hedgeStep phiH dHatPD led1 (HolderSwap p20 dStar20)   -- same delta again
+    (led3, RebateX96 r3) = hedgeStep phiH dHatPD led0 (HolderSwap p20 (negate dStar20)) -- wrong direction
+    (led4, _)            = hedgeStep phiH dHatPD led0 (HolderSwap p20 (3 * dStar20))    -- over-hedge capped
+  assertEqual "qualifying: sign rule" 0 (qualifying 10 0 (-5))
+  assertEqual "qualifying: cap at |Δ*−h|" 10 (qualifying 10 0 25)
+  assertEqual "qualifying: partial" (-4) (qualifying (-10) 0 (-4))
+  if r1 > 0 && ledgerInvariant led1 && hedged led1 == dStar20 then putStrLn "ok: hedgeStep rebates a qualifying hedge"
+    else error ("hedgeStep first hedge: " ++ show (led1, r1))
+  assertEqual "hedgeStep: re-submitting hedged delta → ρ = 0" 0 r2
+  assertEqual "hedgeStep: re-submitting → h unchanged" (hedged led1) (hedged led2)
+  assertEqual "hedgeStep: wrong direction → ρ = 0, h unchanged" (0, 0) (r3, hedged led3)
+  assertEqual "hedgeStep: over-hedge capped at Δ*" dStar20 (hedged led4)
+  -- budget cap: tiny streamia, rebate = B_s − B_r exactly, invariant holds
+  let ledTiny = payStreamia 7 emptyLedger
+      (led5, RebateX96 r5) = hedgeStep phiH dHatPD ledTiny (HolderSwap p20 dStar20)
+      (led6, RebateX96 r6) = hedgeStep phiH dHatPD (payStreamia 0 led5) (HolderSwap (sqrtPriceX96 40) (dAt dHat 40))
+  assertEqual "hedgeStep: rebate capped by budget" 7 r5
+  if ledgerInvariant led5 && ledgerInvariant led6 && r6 == 0 then putStrLn "ok: ledger invariant B_r ≤ B_s under exhausted budget"
+    else error ("ledger invariant broken: " ++ show (led5, led6, r6))
+
+  -- TODO #35: holder path (rebate note §5.3–5.5).
+  -- 5.3 round trip (Trans only): LVR = 0, fees > 0, replica back to start, rebates = fees
+  -- paid (every hedge qualifying, budget ample), Σγ ≥ 0.
+  let
+    tri      = trianglePath 0 40 5
+    accTri   = foldr PA.addAccrual PA.zeroAccrual (PA.planAccrual phiXp phiMp planBig tri)
+    ledAmple = payStreamia (10 ^ (24 :: Int)) emptyLedger
+    repTri   = hedgeAlong phiH planBig 0 ledAmple tri
+    atRep p  = let PayoffX96 y = Payoff.runPayoff replica (sqrtPriceX96 p) in y
+  assertEqual "5.3 round trip: LVR_gross = 0" 0 (PA.lvrGross accTri)
+  if PA.feesTrans accTri > 0 then putStrLn "ok: 5.3 round trip fees > 0" else error "5.3 no fees"
+  assertEqual "5.3 round trip: p_T = p_0" 0 (last (pathEndTicks tri))
+  assertEqual "5.3 round trip: replica back to start" (atRep 0) (atRep (last (pathEndTicks tri)))
+  assertEqual "5.3 rebates = fees on qualifying hedges (ample budget)" (rpFeesPaid repTri) (rpRebates repTri)
+  if rpGamma repTri >= 0 && rpHedges repTri > 0 then putStrLn ("ok: 5.3 Σγ ≥ 0 over " ++ show (rpHedges repTri) ++ " hedges")
+    else error ("5.3 gamma: " ++ show repTri)
+  assertEqual "5.3 holder P&L = Σγ − B_s (rebates offset fees)" (rpGamma repTri - 10 ^ (24 :: Int)) (holderPnL repTri)
+  -- 5.4 convergence: coarser hedging (stride m) leaves more un-hedged convexity — Σγ nondecreasing in m, all ≥ 0.
+  let gammaAt m = rpGamma (hedgeAlong phiH planBig 0 ledAmple (trianglePath 0 40 m))
+      gs = map gammaAt [1, 2, 4, 8]
+  if and (zipWith (<=) gs (drop 1 gs)) && all (>= 0) gs then putStrLn ("ok: 5.4 Σγ nondecreasing in hedge stride " ++ show gs)
+    else error ("5.4 gamma vs stride: " ++ show gs)
+  -- 5.5 stale mark: holder active (gas = 1 tick) keeps |e − p| ≤ 1 after every round and leaves no
+  -- arb volume; holder inactive lets the gap reach the band, arb share > 0 read off the path.
+  let
+    rgOn  = Regime 1 30 True
+    rgOff = Regime 1 30 False
+    maxGap rg = maximum (0 : [ abs (PA.stepTo s - PA.stepFrom s) | s <- composedPath 5 0 300 3 4 rg, PA.stepTag s /= PA.Trans ])
+    -- a correction step's size IS the gap at that round (the pool sits at e after it)
+  assertEqual "5.5 holder active: no residual arb volume" 0 (PA.unArbSharePips (arbShare (composedPath 5 0 300 3 4 rgOn)))
+  if PA.unArbSharePips (arbShare (composedPath 5 0 300 3 4 rgOff)) > 0 then putStrLn "ok: 5.5 holder inactive: arb share > 0 (output)"
+    else error "5.5 no arb volume without holder"
+  if maxGap rgOn <= 1 + 2 * 4 + 3 then putStrLn "ok: 5.5 holder corrections are at most one round of drift"
+    else error ("5.5 holder gap " ++ show (maxGap rgOn))
+  if maxGap rgOff > maxGap rgOn then putStrLn ("ok: 5.5 stale zone without holder: max correction " ++ show (maxGap rgOff) ++ " vs " ++ show (maxGap rgOn))
+    else error ("5.5 gaps: " ++ show (maxGap rgOff, maxGap rgOn))
+  -- TODO #22 (#28), Definition 15 statics (holder inactive): the share is nondecreasing in
+  -- external vol (token1 share on continuous liquidity and tick share); in the band, what
+  -- falls is the NUMBER of corrections — a wider band makes corrections rarer but larger, so
+  -- the volume share need not be monotone (seen: 240819 at band 20 vs 245063 at 40, seed 5).
+  let chCont = createChunk (-4000) 4000 (10 ^ (20 :: Int))
+      pathOf sd band ext = composedPath sd 0 400 2 ext (Regime 1 band False)
+      shareT sd band ext = PA.unArbSharePips (arbShareToken1 [chCont] (pathOf sd band ext))
+      shareK sd band ext = PA.unArbSharePips (arbShare (pathOf sd band ext))
+      nArb sd band ext   = length [ () | st <- pathOf sd band ext, PA.stepTag st == PA.Arb ]
+      monoDown xs = and (zipWith (>=) xs (drop 1 xs))
+      monoUp xs   = and (zipWith (<=) xs (drop 1 xs))
+      bands = [0, 10, 20, 40]
+      exts  = [1, 2, 4, 8]
+  sequence_
+    [ if monoUp [ f sd 10 e | e <- exts ] then pure ()
+        else error ("share ↑ vol fails: seed " ++ show sd ++ " " ++ lbl ++ " " ++ show [ f sd 10 e | e <- exts ])
+    | sd <- [1, 3, 5, 7], (lbl, f) <- [("token1", shareT), ("tick", shareK)] ]
+  sequence_
+    [ if monoDown [ nArb sd b 4 | b <- bands ] then pure ()
+        else error ("#corrections ↓ band fails: seed " ++ show sd ++ " " ++ show [ nArb sd b 4 | b <- bands ])
+    | sd <- [1, 3, 5, 7] ]
+  putStrLn "ok: Def 15 statics: share ↑ in external vol (token1 on continuous liquidity, tick); #corrections ↓ in band (4 seeds)"
+  sequence_
+    [ if PA.unArbSharePips (arbShare (composedPath sd 0 400 2 4 (Regime 1 b True))) == 0 then pure ()
+        else error ("holder active but arb share > 0: seed " ++ show sd ++ " band " ++ show b)
+    | sd <- [1, 3, 5, 7], b <- [2, 10, 40] ]
+  putStrLn "ok: Def 15: holder active with gas 1 ⇒ share = 0 for every band ≥ 2 (4 seeds)"
+  sequence_
+    [ if PA.unArbSharePips (arbShare (composedPath sd 0 400 2 4 (Regime 5 2 True))) > 0 then pure ()
+        else error ("gas > band > 0 should leave arb share > 0: seed " ++ show sd)
+    | sd <- [1, 3, 5, 7] ]
+  putStrLn "ok: Def 15: holder active with gas 5 > band 2 ⇒ arb share > 0 (branch order)"
+
+  -- TODO #26 (#51): λ_{X/M}.  Prop 3: χ(𝓛𝓒) = amount0 = ∂_Pπ(a²) − ∂_Pπ(b²) (Thm 5 + Def 12).
+  let chB = chunks !! 1
+      dAtEdge i = let PriceDeltaX96 d = principalDelta chB (sqrtPriceX96 i) in d
+  assertEqual "Prop 3: χ = amount0 = delta shed across the range"
+    (chi chB) (dAtEdge (chunkTickLower chB) - dAtEdge (chunkTickUpper chB))
+  -- Prop 4 (derived form): one arb correction lo → hi inside the chunk has
+  -- LVR_net = amount_in · [(r½ − 1) − φ], r½ = hi/lo — band-crossing exact, linear in r½ − 1.
+  let
+    phiL   = mkFeePips 1000                                   -- band 10 ticks
+    lo1    = chunkTickLower chB
+    stepOf g = PA.Step lo1 (lo1 + g) PA.Arb
+    netOf g = let PA.Accrual _ fa lg = PA.stepAccrual phiL phiL chB (stepOf g) in lg - fa
+    SqrtPriceX96 sLo = sqrtPriceX96 lo1
+    predicted g = let SqrtPriceX96 sHi = sqrtPriceX96 (lo1 + g)
+                      amt1 = mulDiv (chunkLiquidity chB) (sHi - sLo) Q96
+                  in  mulDiv amt1 (sHi - sLo) sLo - mulDiv amt1 1000 1000000
+  sequence_
+    [ if abs (netOf g - predicted g) <= max 2 (abs (predicted g) `div` 100000) then pure ()
+        else error ("Prop 4 step identity (up) at g = " ++ show g ++ ": " ++ show (netOf g, predicted g))
+    | g <- [1 .. 10] ]
+  -- down side: hi → lo, amount_in = amount0 valued at lo, same bracket.
+  let hi1 = chunkTickUpper chB
+      netDn g = let PA.Accrual _ fa lg = PA.stepAccrual phiL phiL chB (PA.Step hi1 (hi1 - g) PA.Arb) in lg - fa
+      SqrtPriceX96 sHi1 = sqrtPriceX96 hi1
+      predDn g = let SqrtPriceX96 sL = sqrtPriceX96 (hi1 - g)
+                     amt0 = mulDiv (chunkLiquidity chB * Q96) (sHi1 - sL) sHi1 `div` sL
+                     amtIn = mulDiv (mulDiv sL sL Q96) amt0 Q96
+                 in  mulDiv amtIn (sHi1 - sL) sL - mulDiv amtIn 1000 1000000
+  sequence_
+    [ if abs (netDn g - predDn g) <= max 2 (abs (predDn g) `div` 100000) then pure ()
+        else error ("Prop 4 step identity (down) at g = " ++ show g ++ ": " ++ show (netDn g, predDn g))
+    | g <- [1 .. 10] ]
+  putStrLn "ok: Prop 4 step identity, up and down sides"
+  -- Prop 3 independent check: ∫_{a²}^{b²} ∂²π dP = Δ(b⁻) − Δ(a⁺) with deltas from finite
+  -- differences of the PAYOFF (deltaOfPayoff on fromChunk), not from principalDelta.
+  let fdDelta i = let PriceDeltaX96 d = runPayoffDelta (deltaOfPayoff (CLMM.toPayoff (CLMM.fromChunk chB))) (sqrtPriceX96 i) in d
+      integral = fdDelta (chunkTickUpper chB - 1) - fdDelta (chunkTickLower chB + 1)
+  if abs (integral + chi chB) <= chi chB `div` 4   -- one tick in from each edge on a 10-tick chunk: ≤ 20 % + bump
+    then putStrLn "ok: Prop 3 ∫∂²π dP ≈ −χ by finite differences of the payoff"
+    else error ("Prop 3 FD integral: " ++ show (integral, chi chB))
+  -- zero crossing at g = 2·band ticks (sqrt-price return = fee) on a chunk wide enough to
+  -- contain the step: negative at 19, positive at 21, |net(20)| tiny (r½ − 1 = φ up to 1.0001 curvature).
+  let chW = createChunk (-100) 100 (10 ^ (20 :: Int))
+      netW g = let PA.Accrual _ fa lg = PA.stepAccrual phiL phiL chW (PA.Step (-100) (-100 + g) PA.Arb) in lg - fa
+  if netW 19 < 0 && netW 21 > 0 && abs (netW 20) < abs (netW 19) `div` 10
+    then putStrLn "ok: Prop 4 zero crossing at g = 2·band (r½ − 1 = φ)"
+    else error ("Prop 4 crossing: " ++ show (netW 19, netW 20, netW 21))
+  -- Clipped segment (p_j beyond the chunk): LVR_net = amount_in·[p_j²/(lo·hi) − 1 − φ] (up).
+  let hiB = chunkTickUpper chB
+      netClip g = let PA.Accrual _ fa lg = PA.stepAccrual phiL phiL chB (PA.Step lo1 (hiB + g) PA.Arb) in lg - fa
+      SqrtPriceX96 sHiB = sqrtPriceX96 hiB
+      predClip g = let SqrtPriceX96 sPj = sqrtPriceX96 (hiB + g)
+                       amt1 = mulDiv (chunkLiquidity chB) (sHiB - sLo) Q96
+                       ratio = mulDiv (mulDiv sPj sPj Q96) Q96 (mulDiv sLo sHiB Q96)   -- p_j²/(lo·hi), Q96
+                   in  mulDiv amt1 (ratio - Q96) Q96 - mulDiv amt1 1000 1000000
+  sequence_
+    [ if abs (netClip g - predClip g) <= max 4 (abs (predClip g) `div` 10000) then pure ()
+        else error ("Prop 4 clipped segment at g = " ++ show g ++ ": " ++ show (netClip g, predClip g))
+    | g <- [1, 5, 20, 60] ]
+  putStrLn "ok: Prop 4 clipped-segment form (marked at p_j)"
+  -- Path level on CONTINUOUS liquidity (one chunk covering the path, every correction inside):
+  -- seeds × trans amplitudes × fees.  Corrections after a round have size s ± transAmp, so with
+  -- the naive band φ: all steps < 2·band ⇔ s ≤ 2·band − 2·transAmp (λ ≤ 0); smallest step
+  -- ≥ 2·band ⇔ s ≥ 2·band + transAmp (λ > 0).  Rational band 2φ ⇒ λ ≥ 0 everywhere.
+  let chWide = createChunk (-4000) 4000 (10 ^ (20 :: Int))
+      seeds  = [1, 2, 3, 5, 7, 11]
+      amps   = [1, 2, 4]
+      grid   = [2, 4 .. 80]
+  sequence_
+    [ let phiF = mkFeePips phiP
+          band = naiveBandTicks phiF
+          tbl  = [ (sv, lvrRateOn sd 0 600 ta phiF band [chWide] sv) | sv <- grid ]
+          below = [ l | (sv, l) <- tbl, sv <= 2 * band - 2 * ta ]
+          above = [ l | (sv, l) <- tbl, sv >= 2 * band + ta ]
+      in  if all (<= 0) below && all (> 0) above && not (null above) then pure ()
+            else error ("naive band crossing: seed " ++ show sd ++ " amp " ++ show ta ++ " φ " ++ show phiP ++ " " ++ show tbl)
+    | sd <- seeds, ta <- amps, phiP <- [1000, 2000, 3000] ]
+  putStrLn "ok: continuous liquidity + naive band φ ⇒ λ crosses zero in [2φ − 2·transAmp, 2φ + transAmp] ticks (6 seeds × 3 amps × 3 fees)"
+  sequence_
+    [ let phiF = mkFeePips phiP
+          tbl = [ (sv, lvrRateOn sd 0 600 ta phiF (rationalBandTicks phiF) [chWide] sv) | sv <- grid ]
+      in  if all ((>= 0) . snd) tbl then pure () else error ("rational band λ < 0: seed " ++ show sd ++ " amp " ++ show ta ++ " φ " ++ show phiP ++ " " ++ show tbl)
+    | sd <- seeds, ta <- amps, phiP <- [1000, 2000, 3000] ]
+  putStrLn "ok: continuous liquidity + rational band 2φ ⇒ λ ≥ 0 (6 seeds × 3 amps × 3 fees)"
+  -- Slope 1 (Prop 4, linear beyond): with transAmp 1 every correction has size s ± 1, so
+  -- λ(s) ≈ (s/2 − band)·100 pips (1 tick = 100 pips of price = 50 pips of sqrt-return).
+  sequence_
+    [ let phiF = mkFeePips phiP
+          band = naiveBandTicks phiF
+          lamS sv = lvrRateOn sd 0 600 1 phiF band [chWide] sv
+      in  sequence_
+            [ if abs (lamS sv - (50 * toInteger sv - 100 * toInteger band)) <= 60 then pure ()
+                else error ("slope: seed " ++ show sd ++ " φ " ++ show phiP ++ " s " ++ show sv ++ ": " ++ show (lamS sv, 50 * toInteger sv - 100 * toInteger band))
+            | sv <- grid, sv >= 2 * band + 2 ]
+    | sd <- seeds, phiP <- [1000, 2000, 3000] ]
+  putStrLn "ok: continuous liquidity, transAmp 1: λ(s) = (s/2 − band)·100 pips ± 60 (slope 1 in sqrt-return)"
+  -- 4-leg position (legs 10 ticks wide): most corrections are clipped, so the path rate is a
+  -- volume-weighted mean of the clipped form — printed as a regression, not asserted (seed 5).
+  putStrLn ("4-leg λ(s) regression, φ = 1000 naive band, seed 5: "
+    ++ show (lvrRateTable 5 0 600 2 (mkFeePips 1000) (naiveBandTicks (mkFeePips 1000)) planBig [10, 20 .. 60]))
+
+  -- TODO #7 (#3): r^φ = φ_X δ_X + φ_M δ_M exactly (fee on the token paid in), = φ δ_trans when equal.
+  let chsBig = legChunks planBig
+      n1Big  = PayoffX96 (sum [ let PayoffX96 a1 = chunkAmount1 c in a1 | c <- chsBig ])   -- position token1 notional
+      pathTR = composedPath 3 0 300 3 4 (Regime 1 30 False)          -- trans + arb steps; only trans count
+      tov    = transTurnover chsBig pathTR n1Big
+      ReturnPips rRef  = refTransactionalReturn phiXp phiMp tov
+      ReturnPips rMeas = measuredFeeReturn phiXp phiMp chsBig pathTR n1Big
+      ReturnPips rEq   = refTransactionalReturn phiH phiH tov
+      ReturnPips rEqM  = measuredFeeReturn phiH phiH chsBig pathTR n1Big
+  if turnoverX tov > 0 && turnoverM tov > 0 then putStrLn ("ok: δ_trans by side (pips) " ++ show tov) else error ("δ_trans zero: " ++ show tov)
+  if abs (rRef - rMeas) <= 2 then putStrLn ("ok: r^φ = φ_X δ_X + φ_M δ_M = " ++ show rMeas ++ " pips (φ_X ≠ φ_M)")
+    else error ("r^φ mismatch: " ++ show (rRef, rMeas))
+  if abs (rEq - rEqM) <= 2 && abs (rEq - mulDiv 3000 (turnoverX tov + turnoverM tov) 1000000) <= 2
+    then putStrLn ("ok: φ_X = φ_M ⇒ r^φ = φ δ_trans = " ++ show rEq ++ " pips")
+    else error ("r^φ equal-fee: " ++ show (rEq, rEqM))
+  let tri2 = trianglePath 0 40 5
+      ReturnPips rTri = measuredFeeReturn phiH phiH chsBig tri2 n1Big
+      TransTurnover tX tM = transTurnover chsBig tri2 n1Big
+  if rTri > 0 && abs (rTri - mulDiv 3000 (tX + tM) 1000000) <= 2 then putStrLn "ok: round trip: r^φ = φ δ_trans > 0 with zero LVR"
+    else error ("round trip r^φ: " ++ show (rTri, tX, tM))
 
   _ <- evaluate (gammaCoordinate (unXiX96 xiPinned) eta spacing10 (-10 :: Tick))
   putStrLn "ok: gammaCoordinate negative tick"
@@ -1172,6 +1811,33 @@ main = do
     (compositeFeePips (mkFeePips 3000) (mkFeePips 100))
     (toFeePips fs)
 
+  -- MarkUpStructure product fold (distinct from survival toFeePips)
+  let
+    φXmu = mkFeePips 100
+    φMmu = mkFeePips 3000
+    fsMu = mkFeeStructure φXmu φMmu
+    prodManual =
+      FeeFactorX96 $
+        mulX96
+          (unFeeFactorX96 (feeFactor φXmu))
+          (unFeeFactorX96 (feeFactor φMmu))
+  assertEqual
+    "markUpFactors FeeStructure"
+    [φXmu, φMmu]
+    (markUpFactors fsMu)
+  assertEqual
+    "markupPhiX / markupPhiM"
+    (φXmu, φMmu)
+    (markupPhiX fsMu, markupPhiM fsMu)
+  assertEqual
+    "foldMarkUpFactor = ∏ feeFactor"
+    prodManual
+    (foldMarkUpFactor fsMu)
+  assertEqual
+    "foldMarkUpFactor ≠ toFeePips survival composite (non-degenerate)"
+    True
+    (toFeePips fsMu /= mkFeePips 0 && foldMarkUpFactor fsMu /= feeFactor (toFeePips fsMu))
+
   -- ExpectedReturn / ReturnFromKappa
   let
     φXer = mkFeePips 100
@@ -1382,3 +2048,28 @@ main = do
     "fee capture along tenor ≡ sum"
     (PayoffX96 (ypCap + yrCap))
     (runFeeCaptureAlongTenor mapCap fcCap t0Cap)
+
+  -- π^φ(r_φ^e): feeRevenueExpectedReturn + mixture
+  let
+    reFullCap = ExpectedReturn (mkFeePips feePipsScale)
+    reZeroCap = ExpectedReturn (mkFeePips 0)
+    rPhiFull = feeRevenueExpectedReturn fsCap reFullCap
+    rPhiZero = feeRevenueExpectedReturn fsCap reZeroCap
+  assertEqual
+    "feeRevenueExpectedReturn r^e=0 → 0"
+    (mkFeePips 0)
+    (unExpectedReturn rPhiZero)
+  assertEqual
+    "feeRevenueExpectedReturn r^e=scale → φ"
+    (toFeePips fsCap)
+    (unExpectedReturn rPhiFull)
+  let
+    PayoffX96 yCapMix0 =
+      runFeeCaptureAlongTenorMixture mapCap rPhiZero fcCap t0Cap
+  assertEqual "fee capture mixture w=0 ≡ Y_pay" ypCap yCapMix0
+  let
+    -- Full weight on recv: use ExpectedReturn at feePipsScale as r_φ^e directly
+    rPhiAsWeight1 = ExpectedReturn (mkFeePips feePipsScale)
+    PayoffX96 yCapMix1 =
+      runFeeCaptureAlongTenorMixture mapCap rPhiAsWeight1 fcCap t0Cap
+  assertEqual "fee capture mixture w=1 ≡ Y_recv" yrCap yCapMix1

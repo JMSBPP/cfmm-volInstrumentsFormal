@@ -1,3 +1,4 @@
+{-# LANGUAGE PatternSynonyms #-}
 module Liquidity.LiquidityChunk
   ( LiquidityChunk
   , createChunk
@@ -5,10 +6,23 @@ module Liquidity.LiquidityChunk
   , chunkTickLower
   , chunkTickUpper
   , chunkLiquidity
+  , chunkAmount0
+  , chunkAmount1
+  , unitChunk
+  , unitLiquidity
   ) where
 
 import Data.Bits (shiftL, shiftR, (.&.))
-import SqrtGrid (Tick)
+import SqrtGrid
+  ( PayoffX96(..)
+  , SqrtPriceX96(..)
+  , Tick
+  , TickSpacing
+  , mulDiv
+  , pattern Q96
+  , sqrtPriceX96
+  , unTickSpacing
+  )
 
 newtype LiquidityChunk = LiquidityChunk Integer
   deriving (Show, Eq)
@@ -48,3 +62,41 @@ chunkLiquidity (LiquidityChunk w) = w .&. u128Max
 
 unLiquidityChunk :: LiquidityChunk -> Integer
 unLiquidityChunk (LiquidityChunk w) = w
+
+-- | Id_i[𝓛𝓒] ≡ (i, i + Δ_i, 1e18): units handled on the EVM, 1e18 = one unit of L.
+unitLiquidity :: Integer
+unitLiquidity = 10 ^ (18 :: Int)
+
+unitChunk :: Tick -> TickSpacing -> LiquidityChunk
+unitChunk i spacing = createChunk i (i + unTickSpacing spacing) unitLiquidity
+
+sqrtBounds :: LiquidityChunk -> (Integer, Integer)
+sqrtBounds ch =
+  let SqrtPriceX96 a = sqrtPriceX96 (chunkTickLower ch)
+      SqrtPriceX96 b = sqrtPriceX96 (chunkTickUpper ch)
+  in  (a, b)
+
+-- | token0 amount of the chunk when price is at/below p^bid:
+--   L · (1/a − 1/b) = L · (b − a) · Q96 / (a · b)   (LiquidityAmounts.getAmount0ForLiquidity).
+--   By the per-tick CLMM identity (README, #35) this is the scale relating the
+--   chunk principal to the unit CLMMPosition at k½ = √(ab), r = b/a.
+chunkAmount0 :: LiquidityChunk -> PayoffX96
+chunkAmount0 ch =
+  let (a, b) = sqrtBounds ch
+      -- Math.getAmount0ForLiquidity: mulDiv(L << 96, b − a, b) / a  (staged; equals floor(L(b−a)Q96/(ab)))
+      amt = mulDiv (chunkLiquidity ch * Q96) (b - a) b `div` a
+  in  PayoffX96 (checkU128 "chunkAmount0" amt)
+
+-- | token1 amount of the chunk when price is at/above p^ask:
+--   L · (b − a)   (LiquidityAmounts.getAmount1ForLiquidity)
+chunkAmount1 :: LiquidityChunk -> PayoffX96
+chunkAmount1 ch =
+  let (a, b) = sqrtBounds ch
+      -- Math.getAmount1ForLiquidity: mulDiv(L, b − a, Q96)
+  in  PayoffX96 (checkU128 "chunkAmount1" (mulDiv (chunkLiquidity ch) (b - a) Q96))
+
+-- Panoptic casts token amounts with toUint128; mirror the bound.
+checkU128 :: String -> Integer -> Integer
+checkU128 lbl x
+  | x < 0 || x > u128Max = error ("Liquidity.LiquidityChunk." ++ lbl ++ ": amount exceeds uint128")
+  | otherwise = x
